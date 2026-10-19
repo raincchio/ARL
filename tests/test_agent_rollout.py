@@ -15,8 +15,8 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-sys.path.insert(0, os.path.join(os.path.dirname(ROOT), "CudaEnv"))
-sys.path.insert(0, os.path.join(os.path.dirname(ROOT), "CudaEnv", "tests"))
+sys.path.insert(0, os.path.join(ROOT, "envs", "CudaEnv"))
+sys.path.insert(0, os.path.join(ROOT, "envs", "CudaEnv", "tests"))
 
 from cudaenv import CudaTask, CudaWorkspaceEnv, EnvConfig  # noqa: E402
 from test_env_offline import FakeClient  # noqa: E402

@@ -2,7 +2,8 @@
 
 从 ARM（`../ARM`，8821e43）里 Qwen3.8-27B 的 GRPO 训练路径（`script/4c_train_qwen38.sh`）整理出来的精简训练器。
 **对话流程从单轮或 Kevin 式 refine 改成了多轮工具调用的 agentic RL**；环境通过消息层协议接入，
-第一个接进来的是 CudaEnv（`../CudaEnv`，CUDA-Agent 工作区环境）。
+第一个接进来的是 CudaEnv（`envs/CudaEnv`，CUDA-Agent 工作区环境）。
+环境本体放在 `envs/<Name>/`（各自独立的包，ARL 不 import 时不依赖），ARL 侧的适配放在 `arl/envs/<name>.py`；之后的 SweEnv 同样处理。
 
 ```
 torchrun ×N 训练 rank (DeepSpeed ZeRO-3)          rank0 起的 vLLM (SAMPLER_GPUS, TP)
@@ -38,6 +39,7 @@ arl/agent/protocol.py    环境协议 (AgentEnv / TaskSource, 鸭子类型)
 arl/agent/render.py      消息 -> token: 追加 (harness 常态) / 重渲染 + 逐级压缩 (超预算兜底)
 arl/agent/rollout.py     agentic wave rollout + 留档 (trajectories/, best_solutions/)
 arl/envs/cuda.py         CudaEnv 适配 (CudaTasks 题库 -> TaskSource)
+envs/CudaEnv/            CudaEnv 本体 (cudaenv 包; git subtree 自原 ../CudaEnv 导入, 保留历史)
 arl/algorithms/          loss / train_step / ppo_data (Dr-GRPO) / data_processing   <- ARM
 arl/models/              training_client / sampling / dist_sampling / renderers ...  <- ARM
 arl/utils/               distributed / ml_log / checkpoint_utils                      <- ARM

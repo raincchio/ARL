@@ -63,7 +63,7 @@ Qwen3.8 的 `chat_template.jinja` 只认 assistant 消息的 `reasoning_content`
 评测用 `kernelmix`（280 题），冒烟用 `toy`。生成：
 
 ```bash
-cd ../CudaTasks && PYTHONPATH=.:../CudaEval python3 -m cudatasks.generate \
+cd /root/workspace/CudaTasks && PYTHONPATH=.:../CudaEval python3 -m cudatasks.generate \
     --ops6k ../CudaAgent/data/ops6k/train.jsonl --set ops6k
 ```
 

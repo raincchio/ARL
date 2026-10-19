@@ -1,7 +1,7 @@
 """CudaEnv 适配: CudaTasks 题库 + CudaWorkspaceEnv -> ARL 的 TaskSource.
 
-CudaEnv 不是 ARL 的依赖 (ARL 只认协议); 这里按 ``CUDAENV_ROOT`` (缺省兄弟目录
-``../CudaEnv``) 把它放上 sys.path 再 import。
+CudaEnv 不是 ARL 的依赖 (ARL 只认协议); 这里按 ``CUDAENV_ROOT`` (缺省仓内
+``envs/CudaEnv``) 把它放上 sys.path 再 import。
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 _DEFAULT_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-    os.path.dirname(os.path.abspath(__file__))))), "CudaEnv")
+    os.path.abspath(__file__)))), "envs", "CudaEnv")
 
 
 def _import_cudaenv():

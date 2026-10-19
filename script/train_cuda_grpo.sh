@@ -41,7 +41,7 @@ done; done
 (( batch_size >= NPROC )) || { echo "batch_size=$batch_size < $NPROC ranks"; exit 1; }
 
 # 评测服务探活 (repo 模式 + workspace 节点)
-CUDAENV_ROOT="${CUDAENV_ROOT:-$(cd "$ROOT/../CudaEnv" && pwd)}"
+CUDAENV_ROOT="${CUDAENV_ROOT:-$(cd "$ROOT/envs/CudaEnv" && pwd)}"
 env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY PYTHONPATH="$CUDAENV_ROOT" python3 -c "
 from cudaenv.client import check_health; print('>>> eval service:', check_health('$EVAL_ENDPOINT'))" \
   || { echo "评测服务 $EVAL_ENDPOINT 不可用 (需要 /repo/evaluate + ws_version>=1 的活节点)"; exit 1; }
