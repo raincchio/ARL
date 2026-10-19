@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cudaenv"
+version = "0.1.0"
+description = "CUDA-Agent style multi-file workspace environment for agentic RL (CudaEval /repo/evaluate backend)"
+requires-python = ">=3.10"
+dependencies = ["aiohttp>=3.9"]
+
+[tool.setuptools.packages.find]
+include = ["cudaenv*"]
