@@ -39,7 +39,7 @@ arl/agent/protocol.py    环境协议 (AgentEnv / TaskSource, 鸭子类型)
 arl/agent/render.py      消息 -> token: 追加 (harness 常态) / 重渲染 + 逐级压缩 (超预算兜底)
 arl/agent/rollout.py     agentic wave rollout + 留档 (trajectories/, best_solutions/)
 arl/envs/cuda.py         CudaEnv 适配 (CudaTasks 题库 -> TaskSource)
-envs/CudaEnv/            CudaEnv 本体 (cudaenv 包; git subtree 自原 ../CudaEnv 导入, 保留历史)
+envs/CudaEnv/            CudaEnv 本体 (cudaenv 包, 由 ARL 仓库统一管理)
 arl/algorithms/          loss / train_step / ppo_data (Dr-GRPO) / data_processing   <- ARM
 arl/models/              training_client / sampling / dist_sampling / renderers ...  <- ARM
 arl/utils/               distributed / ml_log / checkpoint_utils                      <- ARM
