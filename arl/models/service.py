@@ -40,8 +40,7 @@ def sampling_window(model_name: str, peak_tokens: int, requested: int = 0,
                     prompt_floor: int = 8192) -> int:
     """vLLM 引擎的上下文窗口 (prompt + 生成)。
 
-    ``peak_tokens`` = 这个进程整场会用到的最大生成上限 (训练侧还要算上后期放宽的那一档,
-    见 ppo_loop 的 max_tokens_late)。``requested`` 非 0 时就用它, 否则按老惯例取 2x 峰值。
+    ``peak_tokens`` = 这个进程整场会用到的最大生成上限。``requested`` 非 0 时就用它, 否则按老惯例取 2x 峰值。
 
     无论哪种都夹在模型的 ``max_position_embeddings`` 以内: 超了 vLLM 是**直接拒绝启动**
     (vllm/config/model.py 的 derived max_model_len 检查), 不是降级, 而且要等权重加载完
@@ -76,7 +75,9 @@ class LocalServiceClient:
 
         kwargs = dict(self.training_kwargs)
         kwargs.pop("model_name", None)
-        return LocalTrainingClient(model_name=model_name, **kwargs)
+        client = LocalTrainingClient(model_name=model_name, **kwargs)
+        await client.colocate_bootstrap()
+        return client
 
     def _read_meta(self, path: str) -> dict:
         meta_path = os.path.join(path, "meta.json")
@@ -88,7 +89,10 @@ class LocalServiceClient:
     async def create_training_client_from_state_async(self, path: str):
         from arl.models.training_client import LocalTrainingClient
 
-        meta = self._read_meta(path)
+        # Metadata belongs to policy/ in checkpoints saved by the training loop.
+        policy_dir = os.path.join(path, "policy")
+        weights_dir = policy_dir if os.path.isdir(policy_dir) else path
+        meta = self._read_meta(weights_dir) or self._read_meta(path)
         model_name = meta.get("model_name") or self.training_kwargs.get("model_name")
         if model_name is None:
             raise ValueError(
@@ -96,18 +100,17 @@ class LocalServiceClient:
             )
         kwargs = dict(self.training_kwargs)
         kwargs.pop("model_name", None)
-        # Full policy weights live either at ``path`` itself or under ``path/policy``.
-        policy_dir = os.path.join(path, "policy")
-        weights_dir = policy_dir if os.path.isdir(policy_dir) else path
         # Sampling-only: there is no engine to scatter weights into, and ``weights_dir``
         # is a standard HF checkpoint (_save_full_model writes config+weights+tokenizer),
         # so point vLLM straight at it instead of loading a trainer-side copy.
         if kwargs.get("inference_only"):
             return LocalTrainingClient(model_name=weights_dir, **kwargs)
         client = LocalTrainingClient(model_name=model_name, **kwargs)
+        await client.colocate_bootstrap()
         client.load_policy_weights(weights_dir)
-        # The critic is saved next to policy/ in every checkpoint (value_head.pt, weights +
-        # its Adam state). Resuming must pick it up -- otherwise the run silently restarts
+        client._policy_optimizer_steps = int(meta.get("policy_optimizer_steps", 0))
+        # Critic weights are saved next to policy/ in every checkpoint (value_head.pt).
+        # Resuming must pick them up -- otherwise the run silently restarts
         # from value_init_path (or a random head). It overrides value_init_path on purpose.
         if getattr(client, "_has_value_head", False):
             vh = os.path.join(path, "value_head.pt")

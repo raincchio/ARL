@@ -1,5 +1,7 @@
 # CudaEnv — CUDA-Agent 工作区环境
 
+分类：`coding`；训练环境名 `coding.cuda`（兼容 `cuda`）。训练适配器为 `arl/envs/coding/cuda.py`。
+
 给 agentic RL 用的多文件 CUDA 优化环境，从 CudaAgent 的 `r3lm/envs/agent_workspace_env.py`
 抽出来独立成包，**与训练框架解耦**（不依赖 torch / tokenizer / r3lm），评测后端升级到
 CudaEval 的 `/repo/evaluate`（CudaTasks 题库）。

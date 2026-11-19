@@ -21,13 +21,37 @@ import inspect
 import logging
 import os
 
+import numpy as np
 import torch
 
+from arl.models import router_replay
 from arl.models import types as tinker
 
 logger = logging.getLogger(__name__)
 
 _FINISH_TO_STOP_REASON = {"stop": "stop", "length": "length", "abort": "stop"}
+_routing_warned = [0]
+
+
+def _routing_of(comp, n_input: int):
+    """vLLM 回传的路由 -> 训练要的 [n_input, layers, top_k] (uint8; 专家数 > 256 时 int16)。
+
+    ``n_input`` = prompt + output - 1 = 训练 datum 的 input 长度 (最后一个 token 只当
+    target, 不进前向; vLLM 也正好少它一个)。多出来的截掉, 不够 (或没开回传) 给 None ——
+    训练端对 None 退回自己的路由, 不会错位。
+    """
+    re_ = getattr(comp, "routed_experts", None)
+    if re_ is None:
+        return None
+    re_ = np.asarray(re_)
+    if re_.ndim != 3 or re_.shape[0] < n_input:
+        if _routing_warned[0] < 8:
+            _routing_warned[0] += 1
+            logger.warning(f"[sampler] routed_experts shape {re_.shape} does not cover {n_input} input tokens; "
+                           "this sample falls back to the trainer's own routing")
+        return None
+    re_ = re_[:n_input]
+    return re_.astype(np.uint8 if re_.max(initial=0) < 256 else np.int16)
 
 
 def _init_weight_update_group_worker(worker, host: str, port: int, world_size: int) -> bool:
@@ -104,7 +128,10 @@ def _read_model_config(model_name: str) -> dict:
 
 
 def _extra_engine_args(model_name: str) -> dict:
-    """按模型 config.json 决定两个额外的 vLLM 引擎参数。两个都能用环境变量强制覆盖。
+    """按模型 config.json 决定额外的 vLLM 引擎参数，可用环境变量覆盖。
+
+    5120 维 Qwen 默认启用固定归约内核，KERNEL_RL_FIXED_RMSNORM=0 可关闭；
+    通过 worker_cls 在每个 TP worker 加载模型前安装，配置进入编译缓存哈希。
 
     ── ① 多模态模型: 屏蔽视觉/音频塔 (``language_model_only=True``) ──────────────
     Qwen3.6-27B 这类 ``*ForConditionalGeneration`` 的权重里带一个 vision tower, 而
@@ -173,6 +200,8 @@ def _extra_engine_args(model_name: str) -> dict:
         )
     if mode:
         extra["compilation_config"] = {"cudagraph_mode": mode}
+    from arl.models.fixed_rmsnorm import engine_args as fixed_rmsnorm_engine_args
+    extra.update(fixed_rmsnorm_engine_args(cfg))
     return extra
 
 
@@ -189,6 +218,12 @@ class SamplingEngine:
         # 热更新的原地性已实测验证, 见那边的 docstring)。
         enforce_eager: bool = False,
         tensor_parallel_size: int = 1,
+        # 训练/采样共卡 (arl/colocate): 用 vLLM 的 cumem 分配器, KV 才能单独 unmap。
+        enable_sleep_mode: bool = False,
+        prefill_tokens: int = 0,
+        prefill_batch_tokens: int = 0,
+        enable_prefix_caching: bool | None = None,
+        mamba_cache_mode: str = 'none',
     ):
         from vllm import AsyncEngineArgs, AsyncLLMEngine
 
@@ -207,6 +242,32 @@ class SamplingEngine:
         extra_lp = {"logprobs_mode": lp_mode} if lp_mode else {}
         if lp_mode:
             logger.info(f"[sampler] logprobs_mode={lp_mode}")
+        # 路由回放 (ppo_loop 的 router_replay, 见 arl/models/router_replay.py): 让 vLLM 回传
+        # 每个 token 在每层选的专家。只改回传的东西, 不改怎么采样。
+        if router_replay.enabled():
+            # vLLM 0.19 给 hybrid 模型 (Qwen3.6 的 GDN + attention, 4 个 kv group 共用一个
+            # BlockPool) 开的路由 buffer 只有 num_blocks // 组数 * block_size, attention 的
+            # block id 一过 num_blocks/组数 就 IndexError 打死 EngineCore (1020_v1 第 0 批)。
+            # 修法是 site-packages 里两处 (worker 写端 + scheduler 读端) 改成 num_blocks *
+            # attention block_size; worker 是 spawn 起的, monkeypatch 传不过去。没打补丁就别起。
+            import inspect
+            from vllm.v1.core.sched import scheduler as _vsched
+            from vllm.v1.worker import gpu_model_runner as _vgmr
+            if not ("[ARM patch]" in inspect.getsource(_vsched.Scheduler.__init__)
+                    and "[ARM patch]" in inspect.getsource(
+                        _vgmr.GPUModelRunner.init_routed_experts_capturer)):
+                raise RuntimeError(
+                    "router_replay needs the patched vLLM routed-experts buffer size "
+                    "(vllm/v1/worker/gpu_model_runner.py init_routed_experts_capturer and "
+                    "vllm/v1/core/sched/scheduler.py: max_num_kv_tokens = num_blocks * "
+                    "attention block_size); unpatched vLLM crashes on hybrid models")
+            extra_lp["enable_return_routed_experts"] = True
+            logger.info("[sampler] enable_return_routed_experts=True (router replay)")
+        extra_args = _extra_engine_args(model_name)
+        from arl.models.prefill import engine_args as prefill_engine_args
+        extra_args.update(prefill_engine_args(prefill_tokens,prefill_batch_tokens,extra_args.get("additional_config")))
+        from arl.models.prefix_cache import engine_args as prefix_cache_engine_args
+        extra_args.update(prefix_cache_engine_args(enable_prefix_caching,mamba_cache_mode,_read_model_config(model_name)))
         args = AsyncEngineArgs(
             model=model_name,
             dtype=dtype_str,
@@ -214,12 +275,14 @@ class SamplingEngine:
             enforce_eager=enforce_eager,
             tensor_parallel_size=tensor_parallel_size,
             max_model_len=max_model_len,
-            disable_log_stats=True,
+            enable_sleep_mode=enable_sleep_mode,
+            disable_log_stats=False,
             # 按模型 config.json 追加的参数 (多模态 -> 只留语言塔; 混合线性注意力 ->
             # cudagraph_mode=PIECEWISE)。非这两类模型时是空 dict, 行为不变。
-            **_extra_engine_args(model_name),
+            **extra_args,
             **extra_lp,
         )
+        self._require_prefix_cache_reset = enable_prefix_caching is True
         self.engine = AsyncLLMEngine.from_engine_args(args)
         self._req_counter = 0
         # 在飞请求数 (generate 进/出各记一次), MultiSamplingEngine 按它挑最闲的引擎。
@@ -260,9 +323,9 @@ class SamplingEngine:
     async def reset_prefix_cache(self) -> None:
         """丢掉所有已缓存的前缀 block。**每次权重更新之后都必须调一次**。
 
-        prefix caching 这份代码从没显式打开过, 但 vLLM V1 对 CUDA 上的 generation 模型
-        默认就是开的 (``EngineArgs.enable_prefix_caching`` 默认 None -> ``CacheConfig``
-        的 True), 所以它一直在生效。
+        默认是否开启取决于模型/vLLM；当前Qwen混合模型默认关闭，显式开启需使用
+        enable_prefix_caching=True与mamba_cache_mode=align。只要开启，更新权重后
+        就必须丢弃旧KV/GDN前缀状态。
 
         而这个缓存住在 EngineCore 进程的 scheduler 里, key 只有 token hash —— 它不知道
         底下的权重换过了。``reload_weights`` / ``update_weights_nccl`` 都是 collective_rpc
@@ -275,11 +338,16 @@ class SamplingEngine:
 
         vLLM 只回收没有请求占用的 block: 引擎里还有在跑的请求时这个调用是 no-op 并返回
         False (见 ``scheduler.reset_prefix_cache``)。本项目的 sync 点都卡在两个采样阶段
-        之间, 正常不该有在飞的请求 —— 有就告警, 不去抢占它们 (那些生成本来就正在被这次
-        权重更新腰斩, 是异步 RL 自带的问题, 不归这里管)。
+        之间，正常不应有在飞请求。显式开启缓存时清理失败必须停止，不能继续使用旧策略KV；
+        未显式指定时保留原告警行为。此方法不会自动抢占请求，调用方应先完成或中止它们。
         """
         ok = await self.engine.reset_prefix_cache()
         if not ok:
+            if getattr(self, '_require_prefix_cache_reset', False):
+                raise RuntimeError(
+                    '[sampler] prefix cache reset failed; refusing to continue with stale policy KV. '
+                    'Drain or abort in-flight requests before synchronizing weights.'
+                )
             logger.warning(
                 "[sampler] reset_prefix_cache had no effect: requests still running in the engine are holding KV blocks."
                 "After this weight update, prefix KV computed with the old weights may still be hit."
@@ -357,8 +425,9 @@ class MultiSamplingEngine:
     伙伴减半、聚合 batch 容量翻倍。qwen36_grpo_0905_v1 实测采样窗口占批墙钟 55%,
     是最大的一块。
 
-    调度: ``generate`` 每次挑在飞请求最少的副本 (SamplingEngine.n_inflight), 一条
-    请求从头到尾在同一台引擎上; 副本间没有任何状态共享 —— prefix cache 各自一份
+    调度: 新轨迹按在飞请求数分配，平局按绑定轨迹数分配；有affinity_key的后续轮
+    始终回到同一副本。SamplingClient也把思考/回答两段固定在同一引擎。副本间没有状态共享，
+    prefix cache各自一份
     (同一道题的 8 条轨迹可能分在两边, system prompt 的 KV 各算一次, 代价可忽略)。
 
     权重同步: 副本各自一组 {trainer, 该副本的 TP worker} 的 NCCL 通信器 (端口顺延),
@@ -374,6 +443,8 @@ class MultiSamplingEngine:
         if not engines:
             raise ValueError("MultiSamplingEngine needs at least one engine")
         self._engines = list(engines)
+        self._affinity_replicas: dict[str, int] = {}
+        self._affinity_load = [0] * len(engines)
 
     @property
     def engines(self) -> list[SamplingEngine]:
@@ -384,11 +455,27 @@ class MultiSamplingEngine:
         return sum(e.n_inflight for e in self._engines)
 
     def _pick(self) -> SamplingEngine:
-        # 最闲的副本; 并列取序号小的 (稳定, 便于对日志)。
-        return min(self._engines, key=lambda e: e.n_inflight)
+        index = min(range(len(self._engines)),
+                    key=lambda i: (self._engines[i].n_inflight, self._affinity_load[i]))
+        return self._engines[index]
 
-    async def generate(self, prompt_ids, vllm_params):
-        return await self._pick().generate(prompt_ids, vllm_params)
+    def select_replica(self, affinity_key: str | None = None) -> SamplingEngine:
+        if affinity_key is None:
+            return self._pick()
+        if affinity_key not in self._affinity_replicas:
+            index = min(range(len(self._engines)),
+                        key=lambda i: (self._engines[i].n_inflight, self._affinity_load[i]))
+            self._affinity_replicas[affinity_key] = index
+            self._affinity_load[index] += 1
+        return self._engines[self._affinity_replicas[affinity_key]]
+
+    def release_affinity(self, affinity_key: str) -> None:
+        index = self._affinity_replicas.pop(affinity_key, None)
+        if index is not None:
+            self._affinity_load[index] -= 1
+
+    async def generate(self, prompt_ids, vllm_params, *, affinity_key=None):
+        return await self.select_replica(affinity_key).generate(prompt_ids, vllm_params)
 
     async def reload_weights(self, weights_path: str) -> None:
         import asyncio
@@ -429,6 +516,10 @@ class SamplingClient:
         num_samples: int,
         sampling_params: tinker.SamplingParams,
     ) -> tinker.SampleResponse:
+        if isinstance(self.engine, MultiSamplingEngine):
+            # Resolve once for the entire request, including both thinking/answer stages.
+            replica = self.engine.select_replica(getattr(sampling_params,'affinity_key',None))
+            return await SamplingClient(replica).sample_async(prompt, num_samples, sampling_params)
         from vllm import SamplingParams as VLLMSamplingParams
 
         prompt_ids = prompt.to_ints()
@@ -475,7 +566,8 @@ class SamplingClient:
                 comp.finish_reason or "stop", "stop"
             )  # type: ignore[assignment]
             sequences.append(
-                tinker.SampledSequence(tokens=toks, logprobs=lps, stop_reason=stop_reason)
+                tinker.SampledSequence(tokens=toks, logprobs=lps, stop_reason=stop_reason,
+                                       routed_experts=_routing_of(comp, len(prompt_ids) + len(toks) - 1))
             )
         return tinker.SampleResponse(sequences=sequences)
 
@@ -502,30 +594,36 @@ class SamplingClient:
         if not force or not end:
             raise ValueError("think_budget needs think_force_ids and think_end_ids")
 
-        def _unpack(out):
+        def _unpack(out, n_prompt):
             comp = out.outputs[0]
             toks = list(comp.token_ids)
             lps = ([comp.logprobs[i][tid].logprob for i, tid in enumerate(toks)]
                    if comp.logprobs is not None else None)
-            return toks, lps, comp.finish_reason or "stop"
+            return toks, lps, comp.finish_reason or "stop", _routing_of(comp, n_prompt + len(toks) - 1)
 
-        toks1, lps1, fin1 = _unpack(await self.engine.generate(prompt_ids, make_vparams(budget)))
+        toks1, lps1, fin1, rt1 = _unpack(await self.engine.generate(prompt_ids, make_vparams(budget)),
+                                         len(prompt_ids))
         if fin1 != "length":
             return tinker.SampledSequence(
                 tokens=toks1, logprobs=lps1,
-                stop_reason=_FINISH_TO_STOP_REASON.get(fin1, "stop"))  # type: ignore[arg-type]
+                stop_reason=_FINISH_TO_STOP_REASON.get(fin1, "stop"),  # type: ignore[arg-type]
+                routed_experts=rt1)
 
         has_end = any(toks1[i:i + len(end)] == end for i in range(len(toks1) - len(end) + 1))
         inject = [] if has_end else force
         rest = sp.max_tokens - len(toks1) - len(inject)
         if rest <= 0:
-            return tinker.SampledSequence(tokens=toks1, logprobs=lps1, stop_reason="length")
-        toks2, lps2, fin2 = _unpack(await self.engine.generate(
-            list(prompt_ids) + toks1 + inject, make_vparams(rest)))
+            return tinker.SampledSequence(tokens=toks1, logprobs=lps1, stop_reason="length",
+                                          routed_experts=rt1)
+        prompt2 = list(prompt_ids) + toks1 + inject
+        # 第二段的 prompt 是整条的前缀, 它回传的路由已经覆盖 prompt + 第一段 + 强塞的 token。
+        toks2, lps2, fin2, rt2 = _unpack(await self.engine.generate(prompt2, make_vparams(rest)),
+                                         len(prompt2))
         lps = None if lps1 is None or lps2 is None else lps1 + [0.0] * len(inject) + lps2
         return tinker.SampledSequence(
             tokens=toks1 + inject + toks2, logprobs=lps,
             stop_reason=_FINISH_TO_STOP_REASON.get(fin2, "stop"),  # type: ignore[arg-type]
             loss_mask=[1.0] * len(toks1) + [0.0] * len(inject) + [1.0] * len(toks2),
             think_forced=bool(inject),
+            routed_experts=rt2,
         )

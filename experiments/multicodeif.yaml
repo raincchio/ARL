@@ -1,0 +1,34 @@
+version: 1
+name: multicodeif_feedback
+models:
+  data_policy:
+    backend: openai_compatible
+    name: /models/Qwen/Qwen3.6-35B-A3B
+    base_url: http://127.0.0.1:8200/v1
+    api_key_env: MULTICODEIF_API_KEY
+  evaluated_policy:
+    backend: openai_compatible
+    name: /models/Qwen/Qwen3.6-35B-A3B
+    base_url: http://127.0.0.1:8201/v1
+    api_key_env: MULTICODEIF_API_KEY
+defaults:
+  env: instruction_following.multicodeif
+  harness: multicodeif_self_repair
+  options:
+    suite: single_level
+    constraints: [code_convention_naming_convention, data_structure_type]
+    languages: [python]
+    test_fraction: 0.2
+    split_seed: 0
+    max_rounds: 3
+    max_tokens: 4096
+    chat_template_kwargs: {enable_thinking: false}
+collect:
+  model: data_policy
+  split: train
+  output_dir: ../runs/multicodeif_collect
+evaluate:
+  model: evaluated_policy
+  split: test
+  output_dir: ../runs/multicodeif_evaluate
+# API/text evaluation configuration. For local on-policy GRPO use multicodeif_grpo.yaml.

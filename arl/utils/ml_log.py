@@ -11,6 +11,7 @@ import json
 import logging
 import numbers
 import os
+from pathlib import Path
 import socket
 import time
 from typing import Any
@@ -122,9 +123,11 @@ def setup_logging(
             # Proxy only for wandb: the run env strips the global http(s)_proxy (so
             # internal traffic -- eval endpoint, etc. -- stays direct), and the proxy
             # needed to reach api.wandb.ai is handed to wandb ALONE via Settings.
-            # KERNEL_RL_WANDB_PROXY empty => no proxy (direct / offline).
-            init_kwargs: dict[str, Any] = dict(project=wandb_project, name=wandb_name, config=cfg)
-            proxy = os.environ.get("KERNEL_RL_WANDB_PROXY", "").strip()
+            # Default to the training network proxy; explicitly empty disables
+            # this W&B-specific proxy (launch scripts clear global proxies).
+            init_kwargs: dict[str, Any] = dict(project=wandb_project, name=wandb_name or Path(log_dir).resolve().name,
+                                              dir=str(Path(log_dir).resolve()), config=cfg)
+            proxy = os.environ.get("KERNEL_RL_WANDB_PROXY", "http://10.0.134.70:10809").strip()
             if proxy:
                 init_kwargs["settings"] = wandb.Settings(http_proxy=proxy, https_proxy=proxy)
             wandb_run = wandb.init(**init_kwargs)

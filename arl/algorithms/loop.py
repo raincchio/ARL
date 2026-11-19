@@ -1,14 +1,10 @@
-"""Shared RL training helpers (train step, sampler refresh, padding datum).
-
-Copied from ARM ``r3lm/algorithms/loop.py`` (8821e43); the Kevin-rollout helper
-``do_group_rollout_and_filter`` is dropped. Used by ``arl.grpo``:
-``train_step`` / ``get_updated_sampling_client`` / ``_make_dummy_datum``.
-"""
-
+"""Shared agentic RL training helpers, aligned with the current ARM training path."""
 from __future__ import annotations
 
 import logging
 import math
+import os
+import time
 from typing import Any
 
 import torch
@@ -53,6 +49,95 @@ def remove_mask(datum: tinker.Datum) -> tinker.Datum:
 logger = logging.getLogger(__name__)
 
 
+# ── 跨 rank 重分配一个 substep 的 datum ─────────────────────────────────────────
+# 每个 rank 只训自己采到的那组轨迹, 题目难易不同, token 数能差 3~4 倍 (1023_v4 第 0 批:
+# 每 rank 131k~475k, 均值 318k)。打包路径下各 rank 补 dummy 包对齐到最多的那个 (ZeRO-3
+# lockstep), 训练时间由最重的 rank 定。这里按 token 数把一个 substep 的 datum 在 rank 间
+# 重排 (LPT 贪心, 各 rank 算出同一个方案), 再经 gloo 按源 rank 轮流 scatter 过去。
+#
+# 梯度不变: forward_backward 把每条 response 按 1/n_resp 加权, n_resp 是**这次调用里**
+# 有 active token 的 datum 数 —— 挪过之后各 rank 的 n_resp 就变了。所以挪之前在源 rank
+# 上按原来的 n_resp 算好每条的权重, 写进 loss_fn_inputs["resp_weight"] 跟着走,
+# forward_backward 见到它就用它 (见 training_client)。各 rank 的 (加权) 贡献之和与
+# 重排前逐项相同, DeepSpeed 再跨 rank 取平均, 结果一致 (script/test_rebalance.py)。
+#
+# 只在打包 (KERNEL_RL_PACK_TOKENS>0) 时做: 不打包时每条 datum 一次前向, 各 rank 条数必须
+# 相等, 而重排后条数不等。KERNEL_RL_REBALANCE=0 关掉 (老行为)。
+
+def _rebalance_enabled() -> bool:
+    import torch.distributed as dist
+
+    return (dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+            and int(os.environ.get("KERNEL_RL_PACK_TOKENS", "0")) > 0
+            and os.environ.get("KERNEL_RL_REBALANCE", "1") != "0")
+
+
+def _with_resp_weight(batch: list[tinker.Datum]) -> list[tinker.Datum]:
+    """给本 rank 这个 substep 的每条 datum 挂上 forward_backward 原本会给它的权重 1/n_resp
+    (n_resp 的数法与 forward_backward 逐字一致: advantages 有非零项的 datum 数, 至少 1)。"""
+    n_resp = max(1, sum(1 for d in batch if bool((d.loss_fn_inputs["advantages"].to_torch() != 0).any())))
+    w = tinker.TensorData.from_torch(torch.tensor([1.0 / n_resp], dtype=torch.float64))
+    return [tinker.Datum(model_input=d.model_input, loss_fn_inputs={**d.loss_fn_inputs, "resp_weight": w})
+            for d in batch]
+
+
+def plan_rebalance(costs: list[list[int]]) -> list[list[tuple[int, int]]]:
+    """costs[r][i] = rank r 第 i 条 datum 的代价 (token 数)。返回 assign[r] = 分给 rank r 的
+    (源 rank, 源下标) 列表。LPT: 从大到小, 每条给当前负载最小的 rank (负载相同时优先源 rank,
+    少挪一条; 再相同取小号)。纯函数, 输入相同各 rank 结果相同。"""
+    world = len(costs)
+    items = sorted(((c, r, i) for r, cs in enumerate(costs) for i, c in enumerate(cs)),
+                   key=lambda x: (-x[0], x[1], x[2]))
+    load = [0] * world
+    assign: list[list[tuple[int, int]]] = [[] for _ in range(world)]
+    for c, src, i in items:
+        lo = min(load)
+        dst = src if load[src] == lo else load.index(lo)
+        assign[dst].append((src, i))
+        load[dst] += c
+    return assign
+
+
+def rebalance_substep(batch: list[tinker.Datum]) -> tuple[list[tinker.Datum], dict[str, float]]:
+    """COLLECTIVE (gloo)。返回本 rank 重排后要训的 datum, 以及重排前后的负载统计
+    (各 rank 一致): 最重 rank 的 token 数 / 均值。"""
+    import torch.distributed as dist
+    from arl.utils import distributed as du
+
+    group = du.gloo_group()
+    rank, world = dist.get_rank(), dist.get_world_size()
+    batch = _with_resp_weight(batch)
+    costs = du.all_gather_object([d.model_input.length for d in batch], group=group)
+    assign = plan_rebalance(costs)
+    # 按源 rank 轮流 scatter: 每条 datum 只序列化、传输一次 (MoE 的 routed_experts 每 token
+    # 上 KB, 不能 all_gather 全量)。留在本 rank 的不经 gloo。
+    dest = {(src, i): dst for dst, lst in enumerate(assign) for src, i in lst}
+    got: dict[tuple[int, int], tinker.Datum] = {}
+    for src in range(world):
+        if rank == src:
+            out = [[] for _ in range(world)]
+            for i, d in enumerate(batch):
+                dst = dest[(src, i)]
+                if dst == rank:
+                    got[(src, i)] = d
+                else:
+                    out[dst].append((i, d))
+            recv = [None]
+            dist.scatter_object_list(recv, out, src=src, group=group)
+        else:
+            recv = [None]
+            dist.scatter_object_list(recv, None, src=src, group=group)
+            for i, d in recv[0]:
+                got[(src, i)] = d
+    mine = [got[k] for k in assign[rank]]
+    before = [sum(cs) for cs in costs]
+    after = [sum(costs[s][i] for s, i in lst) for lst in assign]
+    mean = max(1.0, sum(before) / world)
+    stats = {"before": max(before) / mean, "after": max(after) / mean,
+             "moved": float(sum(1 for dst, lst in enumerate(assign) for s, _ in lst if s != dst))}
+    return mine, stats
+
+
 async def train_step(
     data: list[tinker.Datum],
     training_client: tinker.TrainingClient,
@@ -90,6 +175,7 @@ async def train_step(
     clip_wsum = 0.0
     kl_wsum = 0.0
     vloss_total = 0.0
+    last_learning_rate = None
     # In-loss k3 KL penalty vs pi_ref (present only when loss_fn_config carries
     # kl_beta != 0): the per-token rate is token-weighted like ratio/clip/kl, the
     # penalty (an additive loss term) is summed like loss/value_loss.
@@ -102,6 +188,9 @@ async def train_step(
     kl_clamped_total = 0.0
     # 采样分布回放的现场 (training_client 发 ppo/replay_*): 按 active token 数加权累加。
     rp_tok = rp_out = rp_zero = rp_kept = 0.0
+    # 路由回放的现场 (training_client 发 ppo/router_*): agree / set_match 按回放行数加权。
+    rr_rows = rr_rep = rr_agree = rr_match = rr_miss = 0.0
+    saw_rr = False
     # 每个 substep 各自的 (kl_ref, grad_norm)。间歇性 k3 飙升的签名是"两个 substep
     # 只爆一个" (grad_norm ≈ grad_norm_max/2), 均值+最大值定位不到是哪个 —— 拆开记。
     per_substep: list[tuple[float | None, float | None]] = []
@@ -123,19 +212,33 @@ async def train_step(
     nonfinite_active = 0.0
     nonfinite_datums = 0.0
     n_substeps_run = 0
+    # 跨 rank 重排 (见 rebalance_substep): 每个 substep 重排前/后最重 rank 的 token 数 / 均值,
+    # 取各 substep 的最大值。数据重排后本函数返回的 training_logprobs 是本 rank 实际训的那些
+    # datum 的, 和传进来的 data 不再一一对应 (ppo_loop 不用它)。
+    rebalance = _rebalance_enabled()
+    rb_before = rb_after = rb_moved = 0.0
+    t_rebalance = t_fwd_bwd = t_optim = 0.0
 
     for i in range(0, len(data), substep_size):
         batch = data[i : i + substep_size]
+        if rebalance:
+            _t = time.time()
+            batch, st = rebalance_substep(batch)  # COLLECTIVE
+            t_rebalance += time.time() - _t
+            rb_before, rb_after = max(rb_before, st["before"]), max(rb_after, st["after"])
+            rb_moved += st["moved"]
 
         # Forward-backward pass (remove mask key from datums)
         fwd_bwd_kwargs: dict[str, Any] = {"loss_fn": loss_fn}
         if loss_fn_config:
             fwd_bwd_kwargs["loss_fn_config"] = loss_fn_config
+        _t = time.time()
         fwd_bwd_future = await training_client.forward_backward_async(
             [remove_mask(d) for d in batch],
             **fwd_bwd_kwargs,
         )
         fwd_bwd_result = await fwd_bwd_future.result_async()
+        t_fwd_bwd += time.time() - _t
 
         # Accumulate PPO/loss metrics (see training_client forward_backward output).
         m = fwd_bwd_result.metrics or {}
@@ -174,6 +277,14 @@ async def train_step(
             rp_out += float(m.get("ppo/replay_outside_frac", 0.0)) * t_
             rp_zero += float(m.get("ppo/replay_zero_grad_frac", 0.0)) * t_
             rp_kept += float(m.get("ppo/replay_kept_mean", 0.0)) * t_
+        if "ppo/router_replay_rows" in m:
+            saw_rr = True
+            rep_ = float(m.get("ppo/router_replayed_rows", 0.0))
+            rr_rows += float(m["ppo/router_replay_rows"])
+            rr_rep += rep_
+            rr_agree += float(m.get("ppo/router_agree", 0.0)) * rep_
+            rr_match += float(m.get("ppo/router_set_match", 0.0)) * rep_
+            rr_miss += float(m.get("ppo/router_shape_miss", 0.0))
         if "ppo/kl_penalty" in m and not global_bad:
             saw_kl = True
             klref_wsum += float(m.get("ppo/kl_ref_per_token", 0.0)) * n_tok
@@ -187,11 +298,15 @@ async def train_step(
 
         # Optimizer step
         adam_params = get_adam_params(learning_rate)
+        _t = time.time()
         if global_bad:
             optim_future = await training_client.optim_step_async(adam_params, skip=True)
         else:
             optim_future = await training_client.optim_step_async(adam_params)
         optim_result = await optim_future.result_async()
+        if isinstance(optim_result, dict) and "learning_rate" in optim_result:
+            last_learning_rate = float(optim_result["learning_rate"])
+        t_optim += time.time() - _t
         gn = (optim_result or {}).get("grad_norm") if isinstance(optim_result, dict) else None
         # 梯度侧守卫在 optim_step 里自己判定 (forward 有限但梯度 inf/nan, 见
         # training_client._grad_has_inf_or_nan); 它跳的步同样计进 nonfinite_skipped,
@@ -221,7 +336,23 @@ async def train_step(
         "ppo/nonfinite_lp_tokens": nonfinite_tok,
         "ppo/nonfinite_lp_active": nonfinite_active,
         "ppo/nonfinite_datums": nonfinite_datums,
+        # 训练阶段的分项耗时 (rank 本地, 各 substep 求和; 各 rank lockstep, 差不多)。
+        # optim_step 在 ZERO_OFFLOAD=optimizer 时是 CPU 上的 Adam, 看它占多少决定要不要放回 GPU。
+        "time/train_fwd_bwd": t_fwd_bwd,
+        "time/train_optim_step": t_optim,
     }
+    if last_learning_rate is not None:
+        train_metrics["ppo/learning_rate"] = last_learning_rate
+    if rebalance:
+        train_metrics["time/train_rebalance"] = t_rebalance
+        train_metrics["ppo/rebalance_max_over_mean_before"] = rb_before
+        train_metrics["ppo/rebalance_max_over_mean_after"] = rb_after
+        train_metrics["ppo/rebalance_moved_datums"] = rb_moved
+        if int(os.environ.get("RANK", "0")) == 0:
+            logger.info(
+                "[rebalance] heaviest rank / mean tokens: %.2f -> %.2f (worst substep), %d datums moved, %.1fs; "
+                "fwd_bwd %.0fs, optim_step %.0fs", rb_before, rb_after, int(rb_moved), t_rebalance,
+                t_fwd_bwd, t_optim)
     if gn_n:
         # 均值和最大值分开: num_substeps>1 时一批里只要有一个 substep 被裁, 均值也看不出来。
         train_metrics["ppo/grad_norm"] = gn_sum / gn_n
@@ -236,6 +367,12 @@ async def train_step(
         train_metrics["ppo/replay_outside_frac"] = rp_out / rp_tok
         train_metrics["ppo/replay_zero_grad_frac"] = rp_zero / rp_tok
         train_metrics["ppo/replay_kept_mean"] = rp_kept / rp_tok
+    if saw_rr:
+        train_metrics["ppo/router_replay_rows"] = rr_rows
+        train_metrics["ppo/router_replay_frac"] = rr_rep / rr_rows if rr_rows else 0.0
+        train_metrics["ppo/router_agree"] = rr_agree / rr_rep if rr_rep else 0.0
+        train_metrics["ppo/router_set_match"] = rr_match / rr_rep if rr_rep else 0.0
+        train_metrics["ppo/router_shape_miss"] = rr_miss
     if saw_kl:
         train_metrics["ppo/kl_penalty"] = klpen_total
         train_metrics["ppo/kl_ref_per_token"] = (

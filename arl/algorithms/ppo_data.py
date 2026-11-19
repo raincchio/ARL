@@ -9,7 +9,7 @@ NOTE on time scales -- there are two, and only the outer one is discounted:
     gamma=1, which is why there is still no per-token TD/lambda recursion below.
     A per-TOKEN discount or lambda<1 would mean writing real GAE.
 
-The critic is a value head ON the policy backbone (r3lm training_client), not a
+The critic is a value head ON the policy backbone (arl training_client), not a
 separate model. At rollout we forward the value head to get OLD per-token values V_t.
 
 Rewards are the plain bandit case: ``r`` is the scalar for this turn (RM score, or
@@ -73,7 +73,7 @@ the loss weighs every token equally (Dr-GRPO's const_len, see training_client).
 Returns go into each Datum as ``loss_fn_inputs["returns"]`` so forward_backward's
 value loss ``MSE(V_t, R_t)`` can train the head jointly with the policy.
 
-Datum token alignment (input/target/logprobs/mask) is reused from r3lm's
+Datum token alignment (input/target/logprobs/mask) is reused from arl's
 ``trajectory_to_data`` — we only fill in advantages + returns.
 """
 
@@ -320,6 +320,10 @@ def finalize_ppo_data(
     length_weighted_baseline: bool = True,
     adv_estimator: str = "grpo",
     group_adv_std_floor: float = 0.0,
+    mask_positive_incorrect: bool = False,
+    response_correctness: list[bool | None] | None = None,
+    mask_negative_correct: bool = False,
+    distributed_groups: bool = False,
 ) -> tuple[list[Datum], dict[str, float]]:
     """Fill per-token advantages and returns into each datum.
 
@@ -360,6 +364,17 @@ def finalize_ppo_data(
             (default on; see ``group_baseline_advantages`` for why).
         adv_estimator: group mode only -- "grpo" centers the raw rewards, "tailrl"
             first maps each group's rewards to TailRL weights (``tailrl_weights``).
+        mask_positive_incorrect: group mode only; after whitening, zero positive
+            advantages and loss-mask positions on incorrect responses. The trainer
+            also excludes these tokens from KL because its active mask is adv != 0.
+        response_correctness: one label per datum; False means incorrect, True
+            means correct, None means unknown (left unchanged by the gate).
+        mask_negative_correct: group mode only; after whitening, zero negative
+            advantages and loss-mask positions on correct responses, including KL.
+        distributed_groups: COLLECTIVE on every rank, including empty ranks.
+            Gather only reward/group/unit/action-count metadata on CPU. Compute
+            sibling baselines and batch whitening globally; keep token data local.
+            Requires group mode and batch whitening (whiten_groups=None).
 
     Returns:
         (datums, metrics) — group mode reports ``ppo/adv_zero_frac`` (share of
@@ -370,22 +385,57 @@ def finalize_ppo_data(
         statistics for lack of siblings). KL diagnostics come out of
         forward_backward, where the k3 penalty actually lives.
     """
+    if distributed_groups and (groups is None or whiten_groups is not None):
+        raise ValueError("distributed_groups requires group mode and batch whitening")
+    for name, enabled in (("mask_positive_incorrect", mask_positive_incorrect),
+                          ("mask_negative_correct", mask_negative_correct)):
+        if enabled:
+            if groups is None:
+                raise ValueError(f"{name} requires group advantages (GRPO)")
+            if response_correctness is None or len(response_correctness) != len(datums):
+                raise ValueError(f"{name} requires one correctness label per datum")
     metrics: dict[str, float] = {}
     scalar_advs: list[float] | None = None
     has_signal = [True] * len(datums)
     # [T] float mask per datum, 1 on response tokens. 算在前面是因为组内基线要按
     # **长度**加权 (见 group_baseline_advantages 的 lengths), 而长度就是 mask 的和。
     masks_f = [d.loss_fn_inputs["mask"].to_torch().float() for d in datums]
+    global_whitening = None
     if groups is not None:
-        lengths = ([float(m.sum()) for m in masks_f]
-                   if length_weighted_baseline else None)
+        action_counts = [float(m.sum()) for m in masks_f]
+        baseline_rewards, baseline_groups, baseline_units = rewards, groups, units
+        baseline_counts = action_counts
+        local_start = 0
+        if distributed_groups:
+            from arl.utils import distributed as du
+            rank, _, _ = du.dist_info()
+            local_units = [(rank, i if units is None else units[i]) for i in range(len(rewards))]
+            gathered = du.all_gather_object(
+                (rewards, groups, local_units, action_counts), group=du.gloo_group())
+            local_start = sum(len(row[0]) for row in gathered[:rank])
+            baseline_rewards, baseline_groups, baseline_units, baseline_counts = (
+                [item for row in gathered for item in row[column]] for column in range(4))
+        lengths = baseline_counts if length_weighted_baseline else None
         scalar_advs, n_zero, has_signal, shift = group_baseline_advantages(
-            rewards, groups, use_std=group_adv_std, units=units, lengths=lengths,
+            baseline_rewards, baseline_groups, use_std=group_adv_std, units=baseline_units, lengths=lengths,
             estimator=adv_estimator, std_floor=group_adv_std_floor)
-        if rewards:
-            metrics["ppo/adv_zero_frac"] = n_zero / len(rewards)
+        if baseline_rewards:
+            metrics["ppo/adv_zero_frac"] = n_zero / len(baseline_rewards)
         if lengths is not None:
             metrics["ppo/adv_baseline_shift"] = shift
+        if distributed_groups:
+            # One scalar per trajectory segment, repeated for its action tokens.
+            # Two passes avoid cancellation in the sample variance. No token
+            # arrays or model inputs cross ranks, even for very long contexts.
+            active_stats = [(a, count) for a, count, signal in
+                            zip(scalar_advs, baseline_counts, has_signal) if signal]
+            count = sum(n for _, n in active_stats)
+            mean = sum(a*n for a, n in active_stats) / max(1, count)
+            std = (sum(n*(a-mean)**2 for a, n in active_stats) / max(1, count-1))**0.5
+            global_whitening = (count, mean, std)
+            end = local_start + len(rewards)
+            scalar_advs = scalar_advs[local_start:end]
+            has_signal = has_signal[local_start:end]
     elif values_list is None:
         raise ValueError("values_list is required in value-head mode (groups=None)")
 
@@ -421,9 +471,14 @@ def finalize_ppo_data(
         # 推力"的定义, 不为 0 就是在无差别地推高/压低所有 token。value-head 模式
         # has_signal 全 True, 行为与 2026-09-11 之前逐位相同。
         w_idx = [i for i in range(len(advs)) if has_signal[i]]
-        active = (torch.cat([advs[i][masks[i]] for i in w_idx])
-                  if w_idx else torch.empty(0))
-        if active.numel() > 1:
+        if global_whitening is not None:
+            count, batch_mean, batch_std = global_whitening
+            if count > 1:
+                _standardize(w_idx, batch_mean, batch_std)
+        else:
+            active = (torch.cat([advs[i][masks[i]] for i in w_idx])
+                      if w_idx else torch.empty(0))
+        if global_whitening is None and active.numel() > 1:
             batch_mean, batch_std = active.mean(), active.std()
             if whiten_groups is None:
                 _standardize(w_idx, batch_mean, batch_std)
@@ -444,9 +499,31 @@ def finalize_ppo_data(
                         _standardize(idx, ga.mean(), ga.std())
                 metrics["ppo/adv_whiten_singleton_frac"] = n_singleton / len(advs)
 
+    # Gate AFTER whitening: centering can change the sign. Keep every response
+    # in the original baseline/whitening statistics, without recomputing them.
+    # Unknown correctness is left unchanged by either independent gate.
+    blocked = [torch.zeros_like(m) for m in masks]
+    for name, enabled, correctness, sign in (
+        ("positive_incorrect", mask_positive_incorrect, False, 1),
+        ("negative_correct", mask_negative_correct, True, -1),
+    ):
+        if enabled:
+            gate = [masks[i] & (a * sign > 0)
+                    if response_correctness[i] is correctness else torch.zeros_like(masks[i])
+                    for i, a in enumerate(advs)]
+            for i, b in enumerate(gate):
+                blocked[i] |= b
+            metrics[f"ppo/{name}_masked_frac"] = (
+                sum(bool(b.any()) for b in gate) / max(1, len(datums)))
+            metrics[f"ppo/{name}_masked_token_frac"] = (
+                sum(int(b.sum()) for b in gate) / max(1, sum(int(m.sum()) for m in masks)))
+
     out: list[Datum] = []
     for i, (d, a, r) in enumerate(zip(datums, advs, rets)):
         li = dict(d.loss_fn_inputs)
+        if mask_positive_incorrect or mask_negative_correct:
+            li["mask"] = TensorData.from_torch(masks_f[i].masked_fill(blocked[i], 0.0))
+            a = a.masked_fill(blocked[i], 0.0)
         li["advantages"] = TensorData.from_torch(a)
         li["returns"] = TensorData.from_torch(r)
         if ref_logprobs_list is not None:

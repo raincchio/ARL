@@ -1,0 +1,15 @@
+version: 1
+name: external_harness_pairing_example
+models:
+  policy:
+    backend: local
+    name: /models/Qwen/Qwen3.6-35B-A3B
+collect:
+  model: policy
+  env: coding.swe
+  harness: mini_swe_agent
+# Compare the local mini adapter with the Claude Code CLI using the same policy.
+evaluate:
+  model: policy
+  env: coding.swe
+  harness: claude_code

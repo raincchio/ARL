@@ -1,0 +1,13 @@
+{
+  "action": "evaluate",
+  "suite": "single_level",
+  "constraints": ["code_convention_naming_convention", "data_structure_type"],
+  "languages": ["python"],
+  "base_url": "http://127.0.0.1:8200/v1",
+  "model": "/models/Qwen/Qwen3.6-35B-A3B",
+  "max_rounds": 3,
+  "max_tokens": 4096,
+  "temperature": 0.0,
+  "chat_template_kwargs": {"enable_thinking": false},
+  "concurrency": 2
+}

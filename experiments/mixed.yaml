@@ -1,0 +1,63 @@
+version: 1
+name: swe_ifeval_mixed_grpo
+models:
+  policy:
+    backend: local
+    name: /models/Qwen/Qwen3.6-35B-A3B
+train:
+  model: policy
+  output_dir: ../runs/swe_ifeval_mixed_train_claude_code
+  options:
+    batch_size: 8
+    group_size: 8
+    num_epochs: 1
+    mixture_steps_per_epoch: 100
+    shuffle_seed: 0
+    learning_rate: 1.0e-06
+    eval_every: 10
+    eval_at_start: false
+    save_optimizer: true
+  environments:
+  - id: swe
+    env: coding.swe
+    harness: claude_code
+    weight: 0.7
+    options:
+      train_set: remote:/mnt/ai_data/benchmarks/swebench_verified/verified_test.jsonl
+      test_fraction: 0.1
+      swe_endpoint: http://10.0.134.70:18770
+      swe_token_file: /root/ai_data/swe/service/token
+      swe_proxy: http://10.0.134.70:10809
+      eval_max_concurrency: 2
+      env_max_turns: 250
+      swe_command_timeout: 60
+      enable_thinking: true
+      max_tokens: 4096
+      prompt_budget_tokens: 32768
+  - id: ifeval
+    env: instruction_following.ifeval
+    harness: direct
+    weight: 0.3
+    options:
+      train_set: ifeval
+      test_fraction: 0.1
+      ifeval_split_seed: 0
+      ifeval_reward_mode: strict
+      eval_max_concurrency: 4
+      enable_thinking: false
+      max_tokens: 2048
+      prompt_budget_tokens: 8192
+evaluate:
+  model: policy
+  env: instruction_following.ifeval
+  harness: direct
+  output_dir: ../runs/mixed_ifeval_evaluate
+  options:
+    train_set: ifeval
+    test_fraction: 0.1
+    ifeval_split_seed: 0
+    enable_thinking: false
+    max_tokens: 2048
+    prompt_budget_tokens: 8192
+    group_size: 1
+    temperature: 0.0

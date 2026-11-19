@@ -1,0 +1,42 @@
+version: 1
+name: ifeval_instruction_following
+models:
+  policy:
+    backend: local
+    name: /models/Qwen/Qwen3.6-35B-A3B
+defaults:
+  env: instruction_following.ifeval
+  harness: direct
+  model: policy
+  options:
+    train_set: ifeval
+    test_fraction: 0.1
+    ifeval_split_seed: 0
+    ifeval_reward_mode: strict
+    eval_max_concurrency: 4
+    enable_thinking: false
+    max_tokens: 2048
+    prompt_budget_tokens: 8192
+collect:
+  split: train
+  output_dir: ../runs/ifeval_collect
+  options:
+    batch_size: 8
+    group_size: 4
+train:
+  split: train
+  output_dir: ../runs/ifeval_train
+  options:
+    batch_size: 8
+    group_size: 8
+    learning_rate: 1.0e-06
+    eval_every: 0
+    save_optimizer: true
+evaluate:
+  split: test
+  output_dir: ../runs/ifeval_evaluate
+  options:
+    batch_size: 8
+    group_size: 1
+    temperature: 0.0
+    top_p: 1.0

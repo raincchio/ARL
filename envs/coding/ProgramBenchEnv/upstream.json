@@ -1,0 +1,32 @@
+{
+  "repository": "https://github.com/facebookresearch/ProgramBench",
+  "commit": "27f02157c785f8da3647aa6dbbe6b9137f99f10e",
+  "version": "1.2.5",
+  "image_tag": "task_cleanroom_v6",
+  "files": {
+    "__init__.py": "91c43e84cbcff2f6e159c71c680214bbeb63940a7a14c9e35e719371f9cc7ded",
+    "exceptions.py": "53cb154074f86231fba55a6ab0ab5d4cdfd1e66c79a5f9ed145bc6d99a1a91eb",
+    "publish.py": "24a75f09860c699755ba6cbef0d370958ebded7d4686ba6ffafeaed4f92cfbb1",
+    "submission.py": "48d34c0f02f40e550bbcd27a67dd6ce814d9f26badd912a977e048e2acba4c9e",
+    "constants.py": "3a2eba3ce853206abc488d21c793f64647634134530055dd6bd2e35f06138c89",
+    "container.py": "e0faa1d3e846ba725c19b53cf2cff754bf3c6cd4c6f70b07309b75d239dea506",
+    "package.py": "92f72afd2b92e1231161c9cf8fa17e2380b07ef294c56ce13c46a028304f2d8e",
+    "register.py": "e6a7cf116aff0d2d1b060cf04e6c57f496252d7a205f2bc123004523fdcf5a2b",
+    "verify.py": "aa79e2e9af4152bfa0b542dbde3f24bcba121a7b12edd3d021b2a1268a2ef920",
+    "cli/main.py": "ce56d607166d2e62ae4ad89606de48c0b0854ce6f0f1eda948ba7386504dfde2",
+    "cli/submit.py": "97bb9eec80cf57d5fcffd390e5e0af9705959be517a3a341bf0c6955f6cb3b2d",
+    "cli/__init__.py": "2beb79653d60ff89169ae7fcd83e07eb89d7ecf733b7ec515ecf4c050196e002",
+    "cli/blob.py": "fdf0681890240909335e0a9643453f2385ece88cebcbfe6098276ff772774038",
+    "utils/instance_filters.py": "eae6b341f67dcd18fe54422595bbede6814f3a3affc3cb69ffefd889b93f8ac1",
+    "utils/load_data.py": "10355cc12bad16fe6dea699d8b271a56e4bd1525e752554359ca1dac27bcda10",
+    "utils/__init__.py": "eb4ab9f3ec227530f94eb89f8c75a0af161beddfcd592c63c9cf8c6055e1980f",
+    "utils/blob_store.py": "32a0cf08dff1b005940523a88f96e40cf9b6cce71f6097a44e3a258474d35fe5",
+    "utils/internet_control.py": "1f4bbcec7d4457f4ee2f237717de0739c28ad1a366eee751e367b67ec4382751",
+    "eval/__init__.py": "eb4ab9f3ec227530f94eb89f8c75a0af161beddfcd592c63c9cf8c6055e1980f",
+    "eval/eval.py": "8904e2947de17d166a2c579b9d55684ed15143c692024413e24d80645f30d5f9",
+    "eval/eval_batch.py": "31facfb195aa405f3a8bd6335978e0ff8408fff40e9570f91c36ed56604d36c2",
+    "eval/pytest_timeout_retry.py": "d9792db721ba8c0a85b7ad6a117a52375963e3e1deee935596be78c67ab22b95",
+    "data/tasks/testorg__calculator.abc1234/tests/33128f6b8600/eval/tests/test_calculator.py": "2d9fe6ac1bf70673e1d2ad71316fee754d9c6fd61a04a79d8d9e7196946880a3"
+  },
+  "dataset_sha256": "78d1096fb18132f272a2052f4ffef5658a666c17fc17455761d13e0a48e4ae43"
+}

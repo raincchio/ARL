@@ -1,0 +1,139 @@
+[
+  {
+    "name": "codex",
+    "display_name": "Codex",
+    "directory": "harnesses/codex",
+    "status": "pending",
+    "operations": [
+      "collect",
+      "evaluate"
+    ],
+    "interfaces": [
+      "workspace_cli"
+    ],
+    "trace_fields": [],
+    "model_backends": []
+  },
+  {
+    "name": "claude_code",
+    "display_name": "Claude Code",
+    "directory": "harnesses/claude_code",
+    "status": "ready",
+    "aliases": [
+      "claude-code"
+    ],
+    "operations": [
+      "collect",
+      "train",
+      "evaluate"
+    ],
+    "interfaces": [
+      "agent_messages"
+    ],
+    "trace_fields": [
+      "token_ids",
+      "logprobs",
+      "loss_mask"
+    ],
+    "model_backends": [
+      "local"
+    ]
+  },
+  {
+    "name": "mini_swe_agent",
+    "display_name": "mini-swe-agent",
+    "directory": "harnesses/mini_swe_agent",
+    "status": "ready",
+    "aliases": [
+      "mini-swe-agent"
+    ],
+    "operations": [
+      "collect",
+      "train",
+      "evaluate"
+    ],
+    "interfaces": [
+      "agent_messages"
+    ],
+    "trace_fields": [
+      "token_ids",
+      "logprobs",
+      "loss_mask"
+    ],
+    "model_backends": [
+      "local"
+    ]
+  },
+  {
+    "name": "arl_agent",
+    "display_name": "ARL CUDA / KernelBench agent",
+    "directory": "harnesses/arl_agent",
+    "status": "ready",
+    "aliases": [
+      "native"
+    ],
+    "operations": [
+      "collect",
+      "train",
+      "evaluate"
+    ],
+    "interfaces": [
+      "agent_messages"
+    ],
+    "trace_fields": [
+      "token_ids",
+      "logprobs",
+      "loss_mask"
+    ],
+    "model_backends": [
+      "local"
+    ]
+  },
+  {
+    "name": "multicodeif_self_repair",
+    "display_name": "MultiCodeIF official self-repair",
+    "directory": "harnesses/multicodeif_self_repair",
+    "status": "ready",
+    "operations": [
+      "collect",
+      "train",
+      "evaluate"
+    ],
+    "interfaces": [
+      "agent_messages",
+      "text_constraints"
+    ],
+    "trace_fields": [
+      "token_ids",
+      "logprobs",
+      "loss_mask"
+    ],
+    "model_backends": [
+      "local",
+      "openai_compatible",
+      "offline"
+    ]
+  },
+  {
+    "name": "direct",
+    "display_name": "Single-turn instruction following",
+    "directory": "harnesses/direct",
+    "status": "ready",
+    "operations": [
+      "collect",
+      "train",
+      "evaluate"
+    ],
+    "interfaces": [
+      "agent_messages"
+    ],
+    "trace_fields": [
+      "token_ids",
+      "logprobs",
+      "loss_mask"
+    ],
+    "model_backends": [
+      "local"
+    ]
+  }
+]

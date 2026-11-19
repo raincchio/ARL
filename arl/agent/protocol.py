@@ -27,8 +27,9 @@
         def make_env(self, task, uid: str) -> AgentEnv
         async def close(self) -> None              # 可选
 
-奖励按**轨迹**算 (一个终局标量), 同一条轨迹的每一轮共享它 —— adv_unit=trajectory、
-组键 = 题目, 和 ARM 4c (adv_unit=trajectory, Dr-GRPO) 同一口径。
+本协议跨 coding / instruction_following 分类共享，分类与注册在 ``arl.envs`` 中管理。
+奖励由具体环境定义 (如算子优化里程碑或 SWE-bench resolved)，按**轨迹**算一个终局标量，
+同一条轨迹的每一轮共享它 —— adv_unit=trajectory、组键 = 题目。
 """
 
 from __future__ import annotations

@@ -26,6 +26,7 @@ from typing import Any
 import torch
 import torch.utils.checkpoint
 
+from arl.models import router_replay
 from arl.models import types as tinker
 from arl.algorithms.loss import SamplingReplay, gather_target_logprobs, ppo_surrogate
 from arl.models.types import Datum, ForwardBackwardOutput, TensorData
@@ -153,10 +154,10 @@ def _sampler_enforce_eager(inference_only: bool) -> bool:
 def _zero3_comm_tuning() -> dict:
     """ZeRO-3 communication knobs (stage 3 only). Element counts, bf16 = 2 bytes each.
 
-    DeepSpeed 0.14.4 already defaults ``overlap_comm``/``contiguous_gradients`` to
-    True under stage 3, so those two are pinned here only so a version bump can't
-    silently flip them -- they are not a change in behaviour. The two that ARE
-    raised above the defaults buy overlap depth with GPU memory we have spare
+    ``overlap_comm`` defaults to False here while investigating reduce-scatter
+    hangs; KERNEL_RL_ZERO3_OVERLAP_COMM=1 enables it for controlled comparisons.
+    ``contiguous_gradients`` stays True. The two settings raised above the
+    DeepSpeed defaults buy prefetch depth with GPU memory we have spare
     (32B full-FT on 8 ranks sits around 45GB of a 96GiB card):
 
     prefetch_bucket_size  5e7 -> 2e8 elements (~100MB -> ~400MB in flight)
@@ -183,8 +184,7 @@ def _zero3_comm_tuning() -> dict:
     at N=4 for 32B), so it needs the headroom checked before it is turned on.
     """
     cfg = {
-        # Defaults under stage 3; pinned so they can't regress on a version bump.
-        "overlap_comm": True,
+        "overlap_comm": _env_int("KERNEL_RL_ZERO3_OVERLAP_COMM", 0) == 1,
         "contiguous_gradients": True,
         "reduce_scatter": True,
         # 5e8 elements = 1GB per buffer, x2 while overlap_comm double-buffers.
@@ -482,10 +482,16 @@ class LocalTrainingClient:
         zero_stage: int = 3,
         grad_clip: float = 1.0,
         learning_rate: float = 1e-6,
+        warmup_steps: int = 0,
+        warmup_lr_scale: float = 0.5,
         gradient_checkpointing: bool = True,
         sampling_gpu_memory_utilization: float = 0.3,
         sampling_max_model_len: int | None = None,
         sampling_tensor_parallel_size: int = 1,
+        sampling_prefill_tokens: int = 0,
+        sampling_prefill_batch_tokens: int = 0,
+        enable_prefix_caching: bool | None = None,
+        mamba_cache_mode: str = 'none',
         max_tokens: int = 4096,
         enable_value_head: bool = False,
         value_head_coef: float = 0.5,
@@ -500,14 +506,19 @@ class LocalTrainingClient:
         value_init_path: str = "",
         inference_only: bool = False,
     ):
-        import deepspeed
-        from transformers import AutoModelForCausalLM
-
+        from arl import colocate
         from arl.models.tokenizer import get_tokenizer
 
         ensure_distributed_env()
         self.model_name = model_name
         self.dtype = dtype
+        if warmup_steps < 0:
+            raise ValueError("warmup_steps must be >= 0")
+        if not 0 < warmup_lr_scale <= 1:
+            raise ValueError("warmup_lr_scale must be in (0, 1]")
+        self._warmup_steps = warmup_steps
+        self._warmup_lr_scale = warmup_lr_scale
+        self._policy_optimizer_steps = 0
         # PPO value head: a scalar critic (Linear) on the policy's last hidden state.
         # Off by default (pure policy-gradient / GRPO). It is trained by its OWN
         # torch AdamW (lr = value_lr, typically >> the policy lr, so it can fit the
@@ -532,7 +543,7 @@ class LocalTrainingClient:
         # introduces. Env override wins for experiments; else the generation budget.
         #
         # This is the DEFAULT/fallback. A caller that changes the generation budget
-        # mid-run (see ppo_loop's max_tokens_late) passes the budget in effect for
+        # across environments passes the budget in effect for
         # that batch via loss_fn_config["dr_grpo_const_len"] -- Dr-GRPO's constant is
         # *the generation budget*, so it follows the budget rather than staying at
         # whatever the budget happened to be at startup. The env override, being an
@@ -550,13 +561,20 @@ class LocalTrainingClient:
         # Must be set before any _ensure_sampling_engine() call below: engine placement
         # (own card vs. disjoint inference card) branches on it.
         self._inference_only = inference_only
+        # 训练/采样共卡 (见 arl/colocate): 只在训练路径上有意义。
+        colocated = colocate.enabled() and not inference_only
         self._sampling_cfg = dict(
             gpu_memory_utilization=sampling_gpu_memory_utilization,
             max_model_len=sampling_max_model_len,
+            prefill_tokens=sampling_prefill_tokens,
+            prefill_batch_tokens=sampling_prefill_batch_tokens,
+            enable_prefix_caching=enable_prefix_caching, mamba_cache_mode=mamba_cache_mode,
             tensor_parallel_size=sampling_tensor_parallel_size,
             # CUDA graph 默认全开 (见 _sampler_enforce_eager: 热更新的原地性已实测
             # 验证, 训练侧快 2.18x)。KERNEL_RL_ENFORCE_EAGER=1 可退回 eager。
             enforce_eager=_sampler_enforce_eager(inference_only),
+            # 共卡要 vLLM 的 cumem 分配器 (KV 才能按 tag 单独 unmap); 分离式不开, 行为不变。
+            enable_sleep_mode=colocated,
         )
         self._tokenizer = get_tokenizer(model_name)
 
@@ -572,6 +590,13 @@ class LocalTrainingClient:
         # In-flight background checkpoint write (rank 0 only; see _save_full_model).
         self._save_thread: threading.Thread | None = None
         self._save_error: BaseException | None = None
+        self._colocate = None
+        if colocated:
+            from arl.colocate.controller import Colocator
+
+            if zero_stage != 3:
+                raise ValueError(f"colocated training needs ZeRO-3 (got zero_stage={zero_stage}); see arl/colocate")
+            self._colocate = Colocator(self)
 
         # SPMD: create this rank's vLLM engine BEFORE DeepSpeed initializes the
         # multi-rank training NCCL process group. vLLM's spawned EngineCore inits
@@ -603,6 +628,22 @@ class LocalTrainingClient:
             self.device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
             logger.info(f"[sampler] inference-only client for {model_name} (no optimizer)")
             return
+
+        trainer_args = (model_name, dtype, zero_stage, grad_clip, learning_rate,
+                        gradient_checkpointing)
+        if self._colocate is not None:
+            # 共卡: 引擎刚起来, KV 还占着训练要用的显存。DeepSpeed 留给 colocate_bootstrap
+            # (async, 由 service 层 await): 先让 vLLM 放掉 KV, 再初始化。
+            self._pending_trainer_args = trainer_args
+            return
+        self._init_trainer(*trainer_args)
+
+    def _init_trainer(self, model_name, dtype, zero_stage, grad_clip, learning_rate,
+                      gradient_checkpointing) -> None:
+        """HF 模型 + DeepSpeed 引擎 (+ value head)。分离式在 __init__ 里直接调; 共卡模式
+        由 colocate_bootstrap 在采样引擎放掉 KV 之后调。"""
+        import deepspeed
+        from transformers import AutoModelForCausalLM
 
         zero_cfg = {
             "stage": zero_stage,
@@ -681,6 +722,10 @@ class LocalTrainingClient:
         _freeze_moe_router(model)
         # 共享专家的三个矩阵也冻结 (2026-09-07): 迄今所有坏梯度都只落在它们上, 见 _freeze_shared_expert。
         _freeze_shared_expert(model)
+        # 路由回放 (KERNEL_RL_ROUTER_REPLAY=1, 见 arl/models/router_replay.py): 每层 top-k
+        # router 的 forward 换成"有回放索引就用采样时 vLLM 选的专家"。只换 forward, 和冻结互不影响。
+        if router_replay.enabled():
+            router_replay.install(model)
         # MoE x ZeRO-3 x 梯度检查点: expert 执行数据依赖, 重算时参数可能没被重新
         # gather (0827 smoke 首次 backward 的 CheckpointError) —— 整块标成 z3 leaf。
         _set_z3_leaf_moe(model)
@@ -735,6 +780,34 @@ class LocalTrainingClient:
             n_v = sum(p.numel() for p in self._v_head.parameters())
             logger.info(f"[trainer] value net: {self._value_cfg} on hidden_states[{self._value_layer}], "
                         f"{n_v:,} params, separate AdamW (lr={self._value_lr:g}), trunk hidden detached")
+
+    # ---- 训练/采样共卡 (arl/colocate) ------------------------------------- #
+    async def colocate_bootstrap(self) -> None:
+        """共卡模式的后半段初始化: 采样引擎放掉 KV, 再初始化 DeepSpeed。由 service 层在
+        构造完之后 await (__init__ 是同步的, 而引擎的 RPC 只能在它所在的事件循环里 await)。
+        分离式 / 推理模式下什么都不做。"""
+        if self._colocate is None or getattr(self, "_pending_trainer_args", None) is None:
+            return
+        if int(os.environ.get("RANK", "0")) == 0:
+            self._ensure_sampling_engine()  # 单进程时 __init__ 没起引擎
+        await self._colocate.bootstrap()
+        self._colocate.cap_trainer_memory()  # 必须在 DeepSpeed 分配任何东西之前
+        args, self._pending_trainer_args = self._pending_trainer_args, None
+        self._init_trainer(*args)
+        # 到这里所有 rank 都进过 DeepSpeed 的 rendezvous, 早就看见了就绪文件。
+        self._colocate.cleanup_ready_file()
+
+    async def colocate_phase(self, phase: str) -> None:
+        """切到 "train" (采样引擎放 KV) 或 "sample" (训练侧放显存、引擎唤醒)。COLLECTIVE,
+        幂等。分离式下是空操作。"""
+        if self._colocate is None:
+            return
+        if phase == "train":
+            await self._colocate.enter_train()
+        elif phase == "sample":
+            await self._colocate.enter_sample()
+        else:
+            raise ValueError(f"unknown colocate phase {phase!r}")
 
     # ---- tokenizer -------------------------------------------------------- #
     def get_tokenizer(self):
@@ -850,11 +923,16 @@ class LocalTrainingClient:
             adv = li["advantages"].to_torch().float()
             ret = li["returns"].to_torch().float() if "returns" in li else None
             ref = li["ref_logprobs"].to_torch().float() if "ref_logprobs" in li else None
+            # 采样时的 MoE 路由 [T, layers, top_k] (路由回放开着且 vLLM 回传了才有)。
+            rr = li["routed_experts"].to_torch() if "routed_experts" in li else None
+            # 跨 rank 重排过的 datum 带着它在源 rank 上的 1/n_resp (见 algorithms/loop.py 的
+            # rebalance_substep): 用它代替本次调用的 1/n_resp, 梯度与重排前一致。没有 = 老路径。
+            rw = float(li["resp_weight"].to_torch()[0]) if "resp_weight" in li else None
             n_act = int((adv != 0).sum().item())
             n_active_total += n_act
             if n_act > 0:
                 n_resp_active += 1
-            per.append((ids, tgt, old, adv, len(ids), n_act, ret, ref))
+            per.append((ids, tgt, old, adv, len(ids), n_act, ret, ref, rr, rw))
         denom = max(1, n_active_total)
         n_resp = max(1, n_resp_active)
 
@@ -906,6 +984,7 @@ class LocalTrainingClient:
             chunks += [[] for _ in range(n_global - len(chunks))]
         else:
             chunks = [list(range(i, min(i + micro_bsz, len(per)))) for i in range(0, len(per), micro_bsz)]
+        rr_on = router_replay.enabled()
         for ci, idxs in enumerate(chunks):
             # Manual accumulation boundary: reduce grads + allow step() only on the
             # last micro-batch; earlier chunks just accumulate into the grad buffers.
@@ -934,6 +1013,13 @@ class LocalTrainingClient:
                 idxs_eff = list(idxs)
             maxlen = max(lengths)
             mb = len(lengths)
+            if rr_on:
+                # 路由回放: 这个 chunk 的 [N, layers, top_k] 索引, 挂到它的 backward 结束为止
+                # (梯度检查点重算要走同一组专家)。打包 = 首尾相接, 不打包 = 每条补到 maxlen。
+                # dummy chunk / 没有回放数据的 datum 用 -1 行 = 原生路由。
+                router_replay.begin(router_replay.build_index(
+                    [per[j][8] for j in idxs_eff] if idxs_eff else [None], lengths, self.device,
+                    pad_to=None if pack_budget > 0 else maxlen))
             if pack_budget > 0:
                 # One row, sequences back to back. slots[k] = (row, offset) of datum k.
                 input_ids = torch.cat(seqs).unsqueeze(0).to(self.device)
@@ -1019,6 +1105,7 @@ class LocalTrainingClient:
             if not idxs:
                 # dummy: zero loss through the same graph (backward gathers the same
                 # params in the same order as a real chunk), nothing to account for.
+                router_replay.backward_phase()
                 self.engine.backward(lp_row.sum() * 0.0)
                 del logits, lp_row
                 continue
@@ -1070,7 +1157,11 @@ class LocalTrainingClient:
                 # Dr-GRPO: divide THIS response's summed surrogate by a FIXED constant
                 # (generation budget), not its own token count -- no per-response length bias.
                 n_act_j = per[j][5]
+                # 下面三项最后都除以 n_resp; 带 resp_weight 的 datum 先乘 rw * n_resp, 除完就是 rw。
+                rw_scale = per[j][9] * n_resp if per[j][9] is not None else None
                 s = surrogate_tok.sum() / const_len if n_act_j > 0 else surrogate_tok.sum() * 0.0
+                if rw_scale is not None:
+                    s = s * rw_scale
                 surrogate_sum = s if surrogate_sum is None else surrogate_sum + s
                 # Value loss: MSE(V_t, return_t) over response tokens, same normalization
                 # as the policy term (sum/const_len per response) so vf_coef is comparable.
@@ -1083,6 +1174,8 @@ class LocalTrainingClient:
                     mask = (adv != 0).float()
                     vtok = (values[row, off : off + T] - ret) ** 2 * mask
                     vs = vtok.sum() / const_len if n_act_j > 0 else vtok.sum() * 0.0
+                    if rw_scale is not None:
+                        vs = vs * rw_scale
                     value_sum = vs if value_sum is None else value_sum + vs
                 # k3 KL penalty vs pi_ref, on active tokens. Zeroing delta BEFORE
                 # exp makes masked positions contribute exactly 0 (k3(0) = 0), so no
@@ -1115,6 +1208,8 @@ class LocalTrainingClient:
                         delta = delta.clamp(-kl_delta_clamp, kl_delta_clamp)
                     k3 = torch.exp(delta) - delta - 1.0
                     ks = k3.sum() / const_len
+                    if rw_scale is not None:
+                        ks = ks * rw_scale
                     kl_term_sum = ks if kl_term_sum is None else kl_term_sum + ks
                     kl3_tok_sum += float(k3.detach().sum().item())
                 with torch.no_grad():
@@ -1143,9 +1238,11 @@ class LocalTrainingClient:
                 k_chunk = kl_beta * (kl_term_sum / n_resp)
                 loss_chunk = loss_chunk + k_chunk
                 kl_pen_sum += float(k_chunk.detach().item())
+            router_replay.backward_phase()
             self.engine.backward(loss_chunk)
             loss_sum += float(loss_chunk.detach().item())
             del loss_chunk, surrogate_sum
+        router_replay.end()
 
         metrics = {
             "loss": loss_sum,
@@ -1170,6 +1267,10 @@ class LocalTrainingClient:
             metrics["ppo/replay_outside_frac"] = rp_outside / max(1, rp_tok)
             metrics["ppo/replay_zero_grad_frac"] = rp_single / max(1, rp_tok)
             metrics["ppo/replay_kept_mean"] = rp_kept_sum / max(1, rp_tok)
+        if rr_on:
+            # 路由回放现场 (恒发, 各 rank key 集一致): 覆盖率 + trainer 自己的 top-k 和 vLLM
+            # 选的重合度 (= 不回放时有多少路由会不一样)。
+            metrics.update(router_replay.pop_stats())
         if kl_beta != 0.0:
             # Emitted whenever the penalty is configured -- even 0.0 on a rank whose
             # datums are all padding -- so every rank reports the same key set
@@ -1242,11 +1343,13 @@ class LocalTrainingClient:
     def _value_head_path(self, d: str) -> str:
         return os.path.join(d, "value_head.pt")
 
-    def _save_value_head(self, out_dir: str) -> None:
+    def _save_value_head(self, out_dir: str, include_optimizer: bool = True) -> None:
         if self._has_value_head and int(os.environ.get("RANK", "0")) == 0:
             os.makedirs(out_dir, exist_ok=True)
-            torch.save({"v_head": self._v_head.state_dict(), "opt": self._v_opt.state_dict()},
-                       self._value_head_path(out_dir))
+            state = {"v_head": self._v_head.state_dict()}
+            if include_optimizer:
+                state["opt"] = self._v_opt.state_dict()
+            torch.save(state, self._value_head_path(out_dir))
 
     def _load_value_head(self, in_dir: str) -> None:
         path = self._value_head_path(in_dir)
@@ -1257,7 +1360,8 @@ class LocalTrainingClient:
             return
         st = torch.load(path, map_location=self.device)
         self._v_head.load_state_dict(st["v_head"])
-        self._v_opt.load_state_dict(st["opt"])
+        if "opt" in st:
+            self._v_opt.load_state_dict(st["opt"])
 
     # ---- value forward (for PPO GAE at rollout time) --------------------- #
     @torch.no_grad()
@@ -1351,9 +1455,16 @@ class LocalTrainingClient:
             return _ImmediateFuture({"grad_norm": None, "skipped": True})
         # Apply the requested learning rate (DeepSpeed AdamW built at init). The value
         # head is not in this optimizer; it has its own (fixed lr = value_lr).
+        learning_rate = adam_params.learning_rate
+        if self._policy_optimizer_steps < self._warmup_steps:
+            learning_rate *= self._warmup_lr_scale
         for group in self.engine.optimizer.param_groups:
-            group["lr"] = adam_params.learning_rate
+            group["lr"] = learning_rate
         self.engine.step()
+        # Count actual policy updates, not batches or skipped/nonfinite steps.
+        # Critic-only pretraining (policy lr=0) does not consume this warmup.
+        if adam_params.learning_rate > 0:
+            self._policy_optimizer_steps += 1
         if self._has_value_head:
             self._value_head_step(skip=False)
         # Grad norm is populated by step() (after gradient clipping).
@@ -1389,8 +1500,9 @@ class LocalTrainingClient:
                 "DeepSpeed's sentinel arithmetic (a finite but large gradient entered Adam unclipped); continuing training and recording this step's "
                 "grad_norm as None", gn,
             )
-            return _ImmediateFuture({"grad_norm": None, "norm_overflow": True})
-        return _ImmediateFuture({"grad_norm": gn})
+            return _ImmediateFuture({"grad_norm": None, "norm_overflow": True,
+                                     "learning_rate": learning_rate})
+        return _ImmediateFuture({"grad_norm": gn, "learning_rate": learning_rate})
 
     def _grad_has_inf_or_nan(self) -> bool:
         """step 之前查分片梯度里有没有 inf/nan (COLLECTIVE)。命中时把本 rank 上坏掉的
@@ -1523,8 +1635,8 @@ class LocalTrainingClient:
         ``KERNEL_RL_INFER_GPUS`` name with a warning. Defaults to the card right
         after the training range.
 
-        Inference-only runs (rollout) don't come through here -- with no trainer
-        on the card, each rank's sampler simply takes the rank's own card.
+        Single-process native inference also uses an explicit pool with DP replicas.
+        Multi-rank legacy inference keeps its per-rank KERNEL_RL_SAMPLER_TP slice.
         """
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
         raw = os.environ.get("KERNEL_RL_SAMPLER_GPUS", "")
@@ -1566,11 +1678,18 @@ class LocalTrainingClient:
             world_size = int(os.environ.get("WORLD_SIZE", "1"))
             # 训练路径下 SAMPLER_GPUS 可以切成 KERNEL_RL_SAMPLER_DP 份副本 (各自 TP =
             # 卡数/DP, 卡不重叠), 都由 rank 0 起、rank 0 调度 (MultiSamplingEngine);
-            # 默认 1 = 老行为 (一台 TP=卡数 的引擎)。推理路径 (每 rank 自己一台) 不切。
+            # 默认1为一台引擎；单进程推理也支持显式GPU池按DP切分。
             dp = 1
             if self._inference_only:
-                sampler_gpus = self._own_gpus_for_rank()
-                self._sampling_cfg["tensor_parallel_size"] = len(sampler_gpus)
+                if world_size == 1 and os.environ.get("KERNEL_RL_SAMPLER_GPUS"):
+                    # Native standalone inference shares the explicit GPU pool across DP replicas.
+                    replicas_ = self._sampler_replicas()
+                    sampler_gpus = [g for replica in replicas_ for g in replica]
+                    dp = len(replicas_)
+                    self._sampling_cfg["tensor_parallel_size"] = len(replicas_[0])
+                else:
+                    sampler_gpus = self._own_gpus_for_rank()
+                    self._sampling_cfg["tensor_parallel_size"] = len(sampler_gpus)
             else:
                 if int(os.environ.get("RANK", "0")) != 0:
                     return None
@@ -1601,9 +1720,10 @@ class LocalTrainingClient:
             ]
             touched = list(LAUNCHER_VARS) + [
                 "CUDA_VISIBLE_DEVICES", "VLLM_HOST_IP", "NCCL_SHM_DISABLE",
-                "NCCL_P2P_LEVEL",
+                "NCCL_P2P_LEVEL", "PYTORCH_CUDA_ALLOC_CONF",
             ]
             saved = {k: os.environ.get(k) for k in touched}
+            engines = []
             try:
                 if world_size > 1:
                     for k in LAUNCHER_VARS:
@@ -1630,9 +1750,22 @@ class LocalTrainingClient:
                     # trainer side (mirrored in _ensure_weight_comm) -- a
                     # mismatch corrupts the transport handshake.
                     os.environ.setdefault("NCCL_P2P_LEVEL", "SYS")
+                if self._sampling_cfg.get("enable_sleep_mode"):
+                    # 共卡要 vLLM 的 cumem 内存池, 而 torch 不许它和 expandable_segments 同时用
+                    # (worker 起 KV 时 AssertionError "Expandable segments are not compatible with
+                    # memory pool", 74 上 qwen36_grpo_1021_v1/v2 都死在这)。conf 默认开着它是给训练
+                    # 侧治碎片的, 所以只对引擎子进程摘掉, 训练进程照用 (下面 finally 会还原)。
+                    alloc = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+                    kept = [o for o in alloc.split(",") if o.strip() and not o.strip().startswith("expandable_segments")]
+                    if kept:
+                        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(kept)
+                    else:
+                        os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+                    if alloc and ",".join(kept) != alloc:
+                        logger.info(f"[sampler] PYTORCH_CUDA_ALLOC_CONF={alloc!r} -> {','.join(kept)!r} for the engine only "
+                                    f"(sleep mode's memory pool cannot use expandable segments; the trainer keeps them)")
                 # 副本逐台起 (from_engine_args 阻塞到引擎就绪): 每台 spawn 前把
                 # CUDA_VISIBLE_DEVICES 钉到它自己那几张卡。DP=1 时就是原来那一台。
-                engines = []
                 for i, gpus in enumerate(replicas):
                     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpus)  # pin this replica's card(s)
                     logger.info(
@@ -1655,6 +1788,14 @@ class LocalTrainingClient:
                     )
                 else:
                     self._sampling_engine = engines[0]
+            except BaseException:
+                for engine in engines:
+                    try:
+                        engine.shutdown()
+                    except Exception:
+                        logger.exception("Failed to clean up a partially started sampler replica")
+                self._sampling_engine = None
+                raise
             finally:
                 for k, v in saved.items():
                     if v is None:
@@ -1804,7 +1945,8 @@ class LocalTrainingClient:
 
         if int(os.environ.get("RANK", "0")) == 0:
             with open(os.path.join(out_dir, "meta.json"), "w") as f:
-                json.dump({"model_name": self.model_name}, f)
+                json.dump({"model_name": self.model_name,
+                           "policy_optimizer_steps": self._policy_optimizer_steps}, f)
 
     def save_policy_weights(self, out_dir: str, background: bool = False,
                             on_done=None) -> str:
@@ -1815,20 +1957,24 @@ class LocalTrainingClient:
         ``on_done`` (the index line), not by any file's presence.
         """
         self._require_engine("save_policy_weights")
-        self._save_full_model(out_dir, background=background, on_done=on_done)
+        self.wait_pending_save()
+        os.makedirs(out_dir, exist_ok=True)
         self._write_meta(out_dir)
-        # The critic lives outside the engine, so the policy-only ("sampler") checkpoint
-        # would otherwise never contain it. It is small (~33M params + Adam), so keep it
-        # next to policy/ in every checkpoint (rank 0 writes; replicas are identical).
+        # Keep critic weights with every policy; its Adam state lives in ds_state/
+        # so optimizer retention removes both optimizers together. Write these
+        # small files before the writer can publish the completed checkpoint.
         if self._has_value_head:
-            self._save_value_head(os.path.dirname(os.path.normpath(out_dir)))
+            self._save_value_head(os.path.dirname(os.path.normpath(out_dir)),
+                                  include_optimizer=False)
+        self._save_full_model(out_dir, background=background, on_done=on_done)
         return out_dir
 
     def save_optimizer_state(self, out_dir: str) -> str:
         """Save DeepSpeed optimizer/engine state for exact resume."""
         self._require_engine("save_optimizer_state")
-        self.engine.save_checkpoint(out_dir, tag="ds_state")
-        self._save_value_head(out_dir)
+        self.engine.save_checkpoint(out_dir, tag="ds_state", client_state={
+            "policy_optimizer_steps": self._policy_optimizer_steps})
+        self._save_value_head(os.path.join(out_dir, "ds_state"))
         return out_dir
 
     def load_policy_weights(self, weights_dir: str) -> None:
@@ -1884,7 +2030,7 @@ class LocalTrainingClient:
                 )
             await engine.reload_weights(weights_dir)
             # 权重换了, 前缀 KV 没换 —— 必须显式丢掉, 否则下一批采样会命中旧策略算的 KV
-            # (prefix caching 在 vLLM V1 默认开着)。见 sampling.reset_prefix_cache。
+            # 显式开启缓存时清理失败会停止，见sampling.reset_prefix_cache。
             await engine.reset_prefix_cache()
         barrier()
         if int(os.environ.get("RANK", "0")) == 0:
@@ -2074,8 +2220,15 @@ class LocalTrainingClient:
             # save+reload round-trip below would consolidate the base model to disk
             # and read it straight back -- a no-op costing a full model write.
             return SamplingClient(self._ensure_sampling_engine())
-        if self._nccl_sync:
+        if getattr(self, "_colocate", None) is not None:
+            # 同卡 CUDA IPC (见 arl/colocate/controller.py), 完成后引擎已唤醒。
+            named = list(self.engine.module.named_parameters())
+            if self._has_value_head:
+                named = [(n[len("base."):], p) for n, p in named if n.startswith("base.")]
+            await self._colocate.sync_weights(named)
+        elif self._nccl_sync:
             # Cross-GPU NCCL broadcast: trainer cards -> shared sampler TP workers.
+            self._ensure_sampling_engine()  # single-rank sampler initialization is lazy
             await self._sync_to_sampler_nccl()
         else:
             # Overwrite a single dir each step: reload below fully consumes it before
@@ -2100,14 +2253,21 @@ class LocalTrainingClient:
         self._require_engine("save_state")
         policy_dir = os.path.join(out_dir, "policy")
         self._save_full_model(policy_dir)
-        self.engine.save_checkpoint(out_dir, tag="ds_state")
-        self._save_value_head(out_dir)
+        self.engine.save_checkpoint(out_dir, tag="ds_state", client_state={
+            "policy_optimizer_steps": self._policy_optimizer_steps})
+        self._save_value_head(out_dir, include_optimizer=False)
+        self._save_value_head(os.path.join(out_dir, "ds_state"))
         return out_dir
 
     def load_state(self, in_dir: str) -> None:
         self._require_engine("load_state")
-        self.engine.load_checkpoint(in_dir, tag="ds_state")
-        self._load_value_head(in_dir)
+        _, client_state = self.engine.load_checkpoint(in_dir, tag="ds_state")
+        self._policy_optimizer_steps = (client_state or {}).get(
+            "policy_optimizer_steps", self._policy_optimizer_steps)
+        value_dir = os.path.join(in_dir, "ds_state")
+        # Older checkpoints stored both critic weights and Adam state at root.
+        self._load_value_head(value_dir if os.path.isfile(self._value_head_path(value_dir))
+                              else in_dir)
 
     def shutdown(self) -> None:
         """Release the vLLM sampling engine (stops its EngineCore subprocesses).

@@ -129,6 +129,9 @@ def trajectory_to_data(traj: Trajectory, traj_advantage: float) -> list[tinker.D
         sampled_logprobs: list[float] = []
         advantages: list[float] = []
         mask: list[float] = []
+        # 最后一个动作的采样路由 (见 TokensWithLogprobs.maybe_routing)。它那次请求的 prompt
+        # 就是此前的整条序列, 所以它一份就覆盖整个 datum 的 input。
+        routing = None
 
         @classmethod
         def clear(cls):
@@ -136,6 +139,7 @@ def trajectory_to_data(traj: Trajectory, traj_advantage: float) -> list[tinker.D
             cls.sampled_logprobs = []
             cls.advantages = []
             cls.mask = []
+            cls.routing = None
 
     def make_datum_from_state():
         all_tokens_T = _flat_ob_to_model_input(SequenceAccumulator.full_sequence)
@@ -152,15 +156,16 @@ def trajectory_to_data(traj: Trajectory, traj_advantage: float) -> list[tinker.D
             == len(advantages_T)
             == len(mask_T)
         )
-        return tinker.Datum(
-            model_input=input_tokens_T,
-            loss_fn_inputs={
-                "target_tokens": TensorData.from_torch(torch.tensor(target_tokens_T)),
-                "logprobs": TensorData.from_torch(torch.tensor(sampled_logprobs_T)),
-                "advantages": TensorData.from_torch(torch.tensor(advantages_T)),
-                "mask": TensorData.from_torch(torch.tensor(mask_T)),
-            },
-        )
+        loss_fn_inputs = {
+            "target_tokens": TensorData.from_torch(torch.tensor(target_tokens_T)),
+            "logprobs": TensorData.from_torch(torch.tensor(sampled_logprobs_T)),
+            "advantages": TensorData.from_torch(torch.tensor(advantages_T)),
+            "mask": TensorData.from_torch(torch.tensor(mask_T)),
+        }
+        routing = SequenceAccumulator.routing
+        if routing is not None and routing.shape[0] >= input_tokens_T.length:
+            loss_fn_inputs["routed_experts"] = TensorData.from_numpy(routing[: input_tokens_T.length])
+        return tinker.Datum(model_input=input_tokens_T, loss_fn_inputs=loss_fn_inputs)
 
     data: list[tinker.Datum] = []
     for transition in traj.transitions:
@@ -178,6 +183,7 @@ def trajectory_to_data(traj: Trajectory, traj_advantage: float) -> list[tinker.D
         delta_ob_len = _flat_ob_token_len(delta_ob_flat)
         SequenceAccumulator.full_sequence.extend(delta_ob_flat)
         SequenceAccumulator.full_sequence.extend(ac_with_logprobs.tokens)
+        SequenceAccumulator.routing = getattr(ac_with_logprobs, "maybe_routing", None)
         SequenceAccumulator.sampled_logprobs.extend(
             [0.0] * delta_ob_len + ac_with_logprobs.logprobs
         )

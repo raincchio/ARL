@@ -1,0 +1,287 @@
+[
+  {
+    "name": "coding.swe_bench_verified",
+    "display_name": "SWE-bench Verified",
+    "category": "coding",
+    "group": "repository_development",
+    "group_label": "仓库级开发",
+    "directory": "envs/coding/benchmarks/repository_development/swe_bench_verified",
+    "benchmark_status": "pending",
+    "training_status": "pending",
+    "related_environment": "coding.swe"
+  },
+  {
+    "name": "coding.swe_bench_pro",
+    "display_name": "SWE-bench Pro",
+    "category": "coding",
+    "group": "repository_development",
+    "group_label": "仓库级开发",
+    "directory": "envs/coding/benchmarks/repository_development/swe_bench_pro",
+    "benchmark_status": "pending",
+    "training_status": "pending"
+  },
+  {
+    "name": "coding.swe_bench_pro_v2",
+    "display_name": "SWE-bench Pro V2",
+    "category": "coding",
+    "group": "repository_development",
+    "group_label": "仓库级开发",
+    "directory": "envs/coding/benchmarks/repository_development/swe_bench_pro_v2",
+    "benchmark_status": "pending",
+    "training_status": "pending"
+  },
+  {
+    "name": "coding.swe_bench_multilingual",
+    "display_name": "SWE-bench Multilingual",
+    "category": "coding",
+    "group": "repository_development",
+    "group_label": "仓库级开发",
+    "directory": "envs/coding/benchmarks/repository_development/swe_bench_multilingual",
+    "benchmark_status": "pending",
+    "training_status": "pending"
+  },
+  {
+    "name": "coding.deepswe_v1_1",
+    "display_name": "DeepSWE v1.1",
+    "category": "coding",
+    "group": "repository_development",
+    "group_label": "仓库级开发",
+    "directory": "envs/coding/benchmarks/repository_development/deepswe_v1_1",
+    "benchmark_status": "pending",
+    "training_status": "pending"
+  },
+  {
+    "name": "coding.frontierswe",
+    "display_name": "FrontierSWE",
+    "category": "coding",
+    "group": "repository_development",
+    "group_label": "仓库级开发",
+    "directory": "envs/coding/benchmarks/repository_development/frontierswe",
+    "benchmark_status": "pending",
+    "training_status": "pending"
+  },
+  {
+    "name": "coding.frontiercode_v1_1",
+    "display_name": "FrontierCode v1.1",
+    "category": "coding",
+    "group": "repository_development",
+    "group_label": "仓库级开发",
+    "directory": "envs/coding/benchmarks/repository_development/frontiercode_v1_1",
+    "benchmark_status": "pending",
+    "training_status": "pending"
+  },
+  {
+    "name": "coding.cursorbench_4_0",
+    "display_name": "CursorBench 4.0",
+    "category": "coding",
+    "group": "repository_development",
+    "group_label": "仓库级开发",
+    "directory": "envs/coding/benchmarks/repository_development/cursorbench_4_0",
+    "benchmark_status": "pending",
+    "training_status": "pending"
+  },
+  {
+    "name": "coding.terminal_bench_2_1",
+    "display_name": "Terminal-Bench 2.1",
+    "category": "coding",
+    "group": "terminal_tasks",
+    "group_label": "终端任务",
+    "directory": "envs/coding/benchmarks/terminal_tasks/terminal_bench_2_1",
+    "benchmark_status": "pending",
+    "training_status": "pending"
+  },
+  {
+    "name": "coding.terminal_bench_4_0",
+    "display_name": "Terminal-Bench 4.0",
+    "category": "coding",
+    "group": "terminal_tasks",
+    "group_label": "终端任务",
+    "directory": "envs/coding/benchmarks/terminal_tasks/terminal_bench_4_0",
+    "benchmark_status": "pending",
+    "training_status": "pending"
+  },
+  {
+    "name": "coding.nl2repo_bench",
+    "display_name": "NL2Repo-Bench",
+    "category": "coding",
+    "group": "project_generation",
+    "group_label": "从零生成项目",
+    "directory": "envs/coding/benchmarks/project_generation/nl2repo_bench",
+    "benchmark_status": "pending",
+    "training_status": "pending"
+  },
+  {
+    "name": "coding.programbench",
+    "display_name": "ProgramBench",
+    "category": "coding",
+    "group": "project_generation",
+    "group_label": "从零生成项目",
+    "directory": "envs/coding/benchmarks/project_generation/programbench",
+    "benchmark_status": "partial",
+    "training_status": "pending",
+    "related_environment": "coding.programbench",
+    "interface": "agent_messages",
+    "default_harness": "mini_swe_agent",
+    "supported_harnesses": [
+      "mini_swe_agent"
+    ]
+  },
+  {
+    "name": "coding.livecodebench_v6",
+    "display_name": "LiveCodeBench v6",
+    "category": "coding",
+    "group": "competitive_programming",
+    "group_label": "竞赛编程",
+    "directory": "envs/coding/benchmarks/competitive_programming/livecodebench_v6",
+    "benchmark_status": "pending",
+    "training_status": "pending"
+  },
+  {
+    "name": "coding.codeforces_rating",
+    "display_name": "Codeforces Rating",
+    "category": "coding",
+    "group": "competitive_programming",
+    "group_label": "竞赛编程",
+    "directory": "envs/coding/benchmarks/competitive_programming/codeforces_rating",
+    "benchmark_status": "pending",
+    "training_status": "pending"
+  },
+  {
+    "name": "coding.kernelbench",
+    "display_name": "KernelBench",
+    "category": "coding",
+    "group": "kernel_optimization",
+    "group_label": "CUDA 算子优化",
+    "directory": "envs/coding/benchmarks/kernel_optimization/kernelbench",
+    "benchmark_status": "pending",
+    "training_status": "pending",
+    "related_environment": "coding.cuda",
+    "default_harness": "arl_agent",
+    "supported_harnesses": [
+      "arl_agent"
+    ],
+    "interface": "agent_messages"
+  },
+  {
+    "name": "instruction_following.ifeval",
+    "display_name": "IFEval",
+    "category": "instruction_following",
+    "group": "general",
+    "group_label": "通用指令遵循",
+    "directory": "envs/instruction_following/benchmarks/general/ifeval",
+    "benchmark_status": "partial",
+    "training_status": "ready",
+    "related_environment": "instruction_following.ifeval",
+    "interface": "agent_messages",
+    "default_harness": "direct",
+    "supported_harnesses": [
+      "direct"
+    ]
+  },
+  {
+    "name": "instruction_following.ifbench",
+    "display_name": "IFBench",
+    "category": "instruction_following",
+    "group": "general",
+    "group_label": "通用指令遵循",
+    "directory": "envs/instruction_following/benchmarks/general/ifbench",
+    "benchmark_status": "pending",
+    "training_status": "pending"
+  },
+  {
+    "name": "instruction_following.followbench",
+    "display_name": "FollowBench",
+    "category": "instruction_following",
+    "group": "multi_constraint",
+    "group_label": "复杂多约束",
+    "directory": "envs/instruction_following/benchmarks/multi_constraint/followbench",
+    "benchmark_status": "pending",
+    "training_status": "pending"
+  },
+  {
+    "name": "instruction_following.complexbench",
+    "display_name": "ComplexBench",
+    "category": "instruction_following",
+    "group": "multi_constraint",
+    "group_label": "复杂多约束",
+    "directory": "envs/instruction_following/benchmarks/multi_constraint/complexbench",
+    "benchmark_status": "pending",
+    "training_status": "pending"
+  },
+  {
+    "name": "instruction_following.multi_if",
+    "display_name": "Multi-IF",
+    "category": "instruction_following",
+    "group": "multi_turn_multilingual",
+    "group_label": "多轮、多语言",
+    "directory": "envs/instruction_following/benchmarks/multi_turn_multilingual/multi_if",
+    "benchmark_status": "pending",
+    "training_status": "pending"
+  },
+  {
+    "name": "instruction_following.iheval",
+    "display_name": "IHEval",
+    "category": "instruction_following",
+    "group": "instruction_hierarchy",
+    "group_label": "指令优先级",
+    "directory": "envs/instruction_following/benchmarks/instruction_hierarchy/iheval",
+    "benchmark_status": "pending",
+    "training_status": "pending"
+  },
+  {
+    "name": "instruction_following.ifstruct",
+    "display_name": "IFStruct",
+    "category": "instruction_following",
+    "group": "structured_output",
+    "group_label": "结构化输出",
+    "directory": "envs/instruction_following/benchmarks/structured_output/ifstruct",
+    "benchmark_status": "pending",
+    "training_status": "pending"
+  },
+  {
+    "name": "instruction_following.agentif",
+    "display_name": "AgentIF",
+    "category": "instruction_following",
+    "group": "agent",
+    "group_label": "Agent 指令遵循",
+    "directory": "envs/instruction_following/benchmarks/agent/agentif",
+    "benchmark_status": "pending",
+    "training_status": "pending"
+  },
+  {
+    "name": "instruction_following.ifevalcode",
+    "display_name": "IFEvalCode",
+    "category": "instruction_following",
+    "group": "code",
+    "group_label": "代码指令遵循",
+    "directory": "envs/instruction_following/benchmarks/code/ifevalcode",
+    "benchmark_status": "pending",
+    "training_status": "pending"
+  },
+  {
+    "name": "instruction_following.codeif",
+    "display_name": "CodeIF",
+    "category": "instruction_following",
+    "group": "code",
+    "group_label": "代码指令遵循",
+    "directory": "envs/instruction_following/benchmarks/code/codeif",
+    "benchmark_status": "pending",
+    "training_status": "pending"
+  },
+  {
+    "name": "instruction_following.multicodeif",
+    "display_name": "MultiCodeIF",
+    "category": "instruction_following",
+    "group": "code",
+    "group_label": "代码指令遵循",
+    "directory": "envs/instruction_following/benchmarks/code/multicodeif",
+    "benchmark_status": "partial",
+    "training_status": "ready",
+    "interface": "text_constraints",
+    "default_harness": "multicodeif_self_repair",
+    "supported_harnesses": [
+      "multicodeif_self_repair"
+    ],
+    "related_environment": "instruction_following.multicodeif"
+  }
+]

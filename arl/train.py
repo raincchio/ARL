@@ -24,7 +24,6 @@ def main() -> None:
     from chz.blueprint._entrypoint import EntrypointHelpException
     from arl.utils.quiet_deepspeed import import_deepspeed_quietly
 
-    import_deepspeed_quietly()
     blueprint = chz.Blueprint(GRPOConfig)
     try:
         if len(sys.argv) > 1:
@@ -33,6 +32,13 @@ def main() -> None:
         print(e)
         sys.exit(0)
     cfg = blueprint.make()
+    from arl.grpo import _validate
+    try:
+        _validate(cfg, int(os.environ.get("WORLD_SIZE", "1")))
+    except (ValueError, NotImplementedError) as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(2)
+    import_deepspeed_quietly()
     logger.info(f"ARL agentic GRPO: policy={cfg.model_name} env={cfg.env}/{cfg.train_set} "
                 f"log_path={cfg.log_path}")
     exit_code = 0

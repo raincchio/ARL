@@ -1,11 +1,11 @@
 """Self-hosted replacements for the Tinker SDK data types.
 
 These are plain, dependency-free containers that mirror the small subset of the
-``tinker`` public data API that r3lm actually uses (see the seam inventory).
+``tinker`` public data API that arl actually uses (see the seam inventory).
 They carry NO network behaviour -- the hosted clients are replaced separately in
 ``arl.models.{sampling,training_client,service}``.
 
-Only text chunks are supported (r3lm is a text-only task); image chunks from
+Only text chunks are supported (arl is a text-only task); image chunks from
 the original Tinker API are intentionally omitted.
 """
 
@@ -72,7 +72,7 @@ class ModelInput:
     def to_ints(self) -> list[int]:
         """Flatten all text chunks into a single token-id list.
 
-        Non-text chunks are unsupported and raise (r3lm is text-only).
+        Non-text chunks are unsupported and raise (arl is text-only).
         """
         out: list[int] = []
         for c in self.chunks:
@@ -90,7 +90,7 @@ class ModelInput:
 class TensorData:
     """Wrapper for a dense numeric array, matching ``tinker.TensorData``.
 
-    Stored internally as a torch tensor. Only the methods r3lm relies on
+    Stored internally as a torch tensor. Only the methods arl relies on
     are implemented: ``from_torch``/``from_numpy``/``to_torch``/``to_numpy``/
     ``shape``/``tolist``.
     """
@@ -151,6 +151,7 @@ class SamplingParams:
     think_budget: int = 0
     think_force_ids: list[int] | None = None
     think_end_ids: list[int] | None = None
+    affinity_key: str | None = None  # one trajectory stays on one sampler replica
 
 
 @dataclass
@@ -174,6 +175,9 @@ class SampledSequence:
     # 逐 token 的 loss 掩码 (None = 全 1)。思考预算强塞进去的 token 不是策略采的, 记 0。
     loss_mask: list[float] | None = None
     think_forced: bool = False
+    # 路由回放 (arl/models/router_replay.py): vLLM 回传的 [prompt+output-1, layers, top_k]
+    # 专家 id (np.ndarray, uint8)。没开回放时 None。
+    routed_experts: Any = None
 
 
 @dataclass

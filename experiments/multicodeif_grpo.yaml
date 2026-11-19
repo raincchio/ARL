@@ -1,0 +1,37 @@
+version: 1
+name: multicodeif_on_policy_grpo
+models:
+  policy:
+    backend: local
+    name: /models/Qwen/Qwen3.6-35B-A3B
+defaults:
+  env: instruction_following.multicodeif
+  harness: multicodeif_self_repair
+  model: policy
+  options:
+    train_set: multicodeif
+    multicodeif_suite: single_level
+    multicodeif_constraints: [code_convention_naming_convention, data_structure_type]
+    multicodeif_languages: [python]
+    multicodeif_max_rounds: 3
+    multicodeif_reward_mode: strict
+    test_fraction: 0.1
+    multicodeif_split_seed: 0
+    enable_thinking: false
+    max_tokens: 4096
+    prompt_budget_tokens: 32768
+    eval_max_concurrency: 4
+collect:
+  output_dir: ../runs/multicodeif_token_collect
+  options: {batch_size: 1, group_size: 4}
+train:
+  output_dir: ../runs/multicodeif_grpo
+  options:
+    batch_size: 8
+    group_size: 4
+    learning_rate: 1.0e-6
+    eval_every: 0
+    save_optimizer: true
+evaluate:
+  output_dir: ../runs/multicodeif_local_evaluate
+  options: {batch_size: 1, group_size: 1, temperature: 1.0}

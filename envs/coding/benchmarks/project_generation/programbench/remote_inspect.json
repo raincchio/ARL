@@ -1,0 +1,6 @@
+{
+  "action": "inspect",
+  "ssh_host": "root@10.0.134.90",
+  "python": "/mnt/ai_data/benchmarks/programbench/.venv/bin/python",
+  "blob_dir": "/mnt/ai_data/benchmarks/programbench/blobs"
+}

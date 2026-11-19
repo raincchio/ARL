@@ -1,0 +1,45 @@
+version: 1
+name: swe_repair
+models:
+  policy:
+    backend: local
+    name: /models/Qwen/Qwen3.6-35B-A3B
+defaults:
+  env: coding.swe
+  harness: claude_code
+  model: policy
+  options:
+    train_set: remote:/mnt/ai_data/benchmarks/swebench_verified/verified_test.jsonl
+    task_limit: 20
+    test_fraction: 0.1
+    swe_endpoint: http://10.0.134.70:18770
+    swe_token_file: /root/ai_data/swe/service/token
+    swe_proxy: http://10.0.134.70:10809
+    eval_max_concurrency: 2
+    env_max_turns: 250
+    swe_command_timeout: 60
+    max_tokens: 4096
+    prompt_budget_tokens: 32768
+collect:
+  split: train
+  output_dir: ../runs/swe_collect_claude_code
+  options:
+    batch_size: 2
+    group_size: 2
+train:
+  split: train
+  output_dir: ../runs/swe_train_claude_code
+  options:
+    batch_size: 8
+    group_size: 8
+    eval_every: 0
+    save_optimizer: true
+evaluate:
+  split: test
+  output_dir: ../runs/swe_evaluate_claude_code
+  options:
+    batch_size: 2
+    group_size: 1
+    temperature: 1.0  # actual Qwen sampling parameters are controlled by ARL
+    top_p: 1.0
+    top_k: -1

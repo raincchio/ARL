@@ -44,7 +44,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import dataclass, field, replace
 
 from arl.models import types as tinker
 from arl.utils import distributed as dist_utils
@@ -88,6 +89,46 @@ class DistributedSamplingClient:
         #   (origin_rank, req_id) -> Task. Survives across calls -- that IS the
         #   feature: requests submitted in wave N may come back in wave N+3.
         self._inflight: dict[tuple[int, str], asyncio.Task] = {}
+        self._affinity_namespace = uuid.uuid4().hex
+        self._affinity_scope_seq = 0
+        self._scope_affinities: dict[str, set[str]] = {}
+        self._request_scopes: dict[tuple[int, str], str] = {}
+
+    def begin_affinity_scope(self) -> str:
+        # SPMD ranks call rollouts in the same order; each shares this sequence number.
+        # The rank-0 client namespace + source rank also isolate multiple clients/ranks.
+        self._affinity_scope_seq += 1
+        return str(self._affinity_scope_seq)
+
+    def _with_affinity(self, request: SampleRequest, origin: int) -> SampleRequest:
+        key = request.extras.get('affinity_key')
+        if key is None:
+            return request
+        key = f'{self._affinity_namespace}:{origin}:{key}'
+        scope = request.extras.get('affinity_scope')
+        if scope is not None:
+            self._scope_affinities.setdefault(str(scope), set()).add(key)
+        return replace(request, extras={**request.extras, 'affinity_key': key})
+
+    async def end_affinity_scope(self, scope: str) -> None:
+        # No new collective: only rank 0 owns the shared pool. At normal completion
+        # rollout already globally drained; on errors cancel only this scope's work.
+        tasks = []
+        for key, request_scope in list(self._request_scopes.items()):
+            if request_scope == scope:
+                self._request_scopes.pop(key)
+                task = self._inflight.pop(key, None)
+                if task is not None:
+                    if not task.done():
+                        task.cancel()
+                    tasks.append(task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        from arl.models.sampling import MultiSamplingEngine
+        keys = self._scope_affinities.pop(scope, set())
+        if isinstance(self.engine, MultiSamplingEngine):
+            for key in keys:
+                self.engine.release_affinity(key)
 
     # ---- collective batch interface --------------------------------------- #
     async def sample_batch(
@@ -98,12 +139,13 @@ class DistributedSamplingClient:
         Every rank must call this in the same phase, empty list included.
         """
         if self._world_size <= 1:
-            return await self._run_requests(requests)
+            return await self._run_requests([self._with_affinity(r, 0) for r in requests])
 
         group = dist_utils.gloo_group()
         gathered = dist_utils.gather_object_to_rank0(requests, group=group)
         if self._rank == 0:
-            flat: list[SampleRequest] = [r for per_rank in gathered for r in per_rank]
+            flat: list[SampleRequest] = [self._with_affinity(r, origin)
+                for origin, per_rank in enumerate(gathered) for r in per_rank]
             flat_results = await self._run_requests(flat)
             # regroup by originating rank
             out: list[list] = []
@@ -178,6 +220,7 @@ class DistributedSamplingClient:
         """rank-0-side: cancel in-flight generations; popped first so ``_poll``
         never hands their (cancelled) tasks back."""
         for rid in rids:
+            self._request_scopes.pop((origin, rid), None)
             task = self._inflight.pop((origin, rid), None)
             if task is not None and not task.done():
                 task.cancel()
@@ -189,7 +232,10 @@ class DistributedSamplingClient:
             if key in self._inflight:
                 logger.warning(f"duplicate req_id in flight, dropping: {key}")
                 continue
-            self._inflight[key] = asyncio.ensure_future(self._one(req))
+            scope = req.extras.get('affinity_scope')
+            if scope is not None:
+                self._request_scopes[key] = str(scope)
+            self._inflight[key] = asyncio.ensure_future(self._one(self._with_affinity(req, origin)))
 
     async def _poll(
         self, timeout: float
@@ -212,6 +258,7 @@ class DistributedSamplingClient:
             if not task.done():
                 continue
             del self._inflight[key]
+            self._request_scopes.pop(key, None)
             origin, rid = key
             try:
                 seq = task.result()
@@ -254,6 +301,7 @@ class DistributedSamplingClient:
                 top_p=req.top_p,
                 top_k=req.top_k,
                 seed=req.seed,
+                affinity_key=req.extras.get('affinity_key'),
                 think_budget=req.think_budget,
                 think_force_ids=req.think_force_ids,
                 think_end_ids=req.think_end_ids,
@@ -274,6 +322,9 @@ class DistributedSamplingClient:
             )
         from arl.models.sampling import SamplingClient
 
+        if sampling_params.affinity_key is not None:
+            sampling_params = replace(sampling_params,
+                affinity_key=f'{self._affinity_namespace}:0:{sampling_params.affinity_key}')
         return await SamplingClient(self.engine).sample_async(
             prompt=prompt, num_samples=num_samples, sampling_params=sampling_params
         )

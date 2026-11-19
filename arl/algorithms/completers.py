@@ -9,7 +9,7 @@ samples from a local vLLM-backed :class:`~arl.models.sampling.SamplingClient`.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypeAlias
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 from arl.models import types as tinker
 
@@ -30,6 +30,8 @@ class TokensWithLogprobs:
     stop_reason: tinker.StopReason = "stop"
     # 逐 token 的 loss 掩码, None = 全 1 (见 SampledSequence.loss_mask)。
     maybe_mask: list[float] | None = None
+    # 采样时的 MoE 路由, 覆盖 prompt + 本次输出 (见 SampledSequence.routed_experts)。
+    maybe_routing: Any = None
 
     @property
     def logprobs(self) -> list[float]:
@@ -101,6 +103,7 @@ class LocalTokenCompleter(TokenCompleter):
             tokens=sampled_seq.tokens,
             maybe_logprobs=sampled_seq.logprobs,
             stop_reason=sampled_seq.stop_reason,
+            maybe_routing=sampled_seq.routed_experts,
         )
 
 

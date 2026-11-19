@@ -1,0 +1,8 @@
+{
+  "action": "evaluate",
+  "suite": "single_level",
+  "constraints": ["code_convention_naming_convention", "data_structure_type"],
+  "languages": ["python"],
+  "predictions": "/path/to/predictions.jsonl",
+  "max_rounds": 1
+}

@@ -1,0 +1,52 @@
+version: 1
+name: programbench_rebuild
+models:
+  policy:
+    backend: local
+    name: /models/Qwen/Qwen3.6-35B-A3B
+defaults:
+  env: coding.programbench
+  harness: mini_swe_agent
+  model: policy
+  options:
+    train_set: programbench
+    programbench_task_ids: lh3__seqtk.94e7070,tomnomnom__gron.88a6234,cmatsuoka__figlet.202a0a8
+    test_fraction: 0.34
+    programbench_split_seed: 0
+    programbench_ssh_host: root@10.0.134.90
+    programbench_python: /mnt/ai_data/benchmarks/programbench/.venv/bin/python
+    programbench_blob_dir: /mnt/ai_data/benchmarks/programbench/blobs
+    programbench_work_dir: /mnt/ai_data/arl/programbench_runs
+    programbench_reward_mode: fraction
+    programbench_memory: 60g
+    programbench_cpus: 20
+    programbench_eval_cpus: 4
+    programbench_branch_workers: 1
+    programbench_eval_timeout: 3600
+    eval_max_concurrency: 1
+    env_max_turns: 1000
+    programbench_command_timeout: 180
+    max_tokens: 4096
+    prompt_budget_tokens: 32768
+collect:
+  output_dir: ../runs/programbench_collect
+  options:
+    batch_size: 1
+    group_size: 2
+train:
+  output_dir: ../runs/programbench_train
+  options:
+    batch_size: 8
+    group_size: 4
+    learning_rate: 1.0e-06
+    eval_every: 0
+    save_optimizer: true
+  harness: mini_swe_agent
+evaluate:
+  output_dir: ../runs/programbench_evaluate
+  options:
+    batch_size: 1
+    group_size: 1
+    temperature: 1.0  # local sampler default; official API configuration leaves it unset
+    top_p: 1.0
+    top_k: -1

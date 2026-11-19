@@ -15,8 +15,8 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-sys.path.insert(0, os.path.join(ROOT, "envs", "CudaEnv"))
-sys.path.insert(0, os.path.join(ROOT, "envs", "CudaEnv", "tests"))
+sys.path.insert(0, os.path.join(ROOT, "envs", "coding", "CudaEnv"))
+sys.path.insert(0, os.path.join(ROOT, "envs", "coding", "CudaEnv", "tests"))
 
 from cudaenv import CudaTask, CudaWorkspaceEnv, EnvConfig  # noqa: E402
 from test_env_offline import FakeClient  # noqa: E402
@@ -130,6 +130,9 @@ async def main(tok_path: str) -> int:
           (t3.n_appended, t3.n_rerendered, len(t3.datums)))
     check("returns/groups/units parallel to datums",
           len(res.datums) == len(res.returns) == len(res.groups) == len(res.units) == 8)
+    check("terminal correctness stays aligned through truncation and merging",
+          len(res.correctness) == len(res.datums)
+          and all(c == (r >= 1) for c, r in zip(res.correctness, res.returns)))
     # 合成的 datum 里: 模型的思考原样在 (harness, 不剥), 且序列 = 最后一轮 prompt + 最后一轮回复
     t0 = res.trajs[0]
     seq = t0.datums[0].model_input.to_ints() + [int(t0.datums[0].loss_fn_inputs["target_tokens"].to_torch()[-1])]
@@ -160,6 +163,38 @@ async def main(tok_path: str) -> int:
           pos and neg and min(pos) > 0 > max(neg), (pos[:3], neg[:3]))
     check("metrics present", res.metrics.get("rollout/correct_rate") == 0.5
           and "rollout/truncated_rate" in res.metrics, res.metrics)
+    # Thinking cost changes training returns only, keeping task metrics and labels intact.
+    p.think_cost_lambda = 8.192
+    shaped = await run_agent_rollout(tasks, Source(client), ScriptedSampler(tok, script),
+                                     renderer, p, train=True, log_turns=True)
+    for t in shaped.trajs:
+        check(f"trajectory {t.tid}: cost counts raw sampled thinking, including masked truncation",
+              t.think_tokens > 0 and abs(t.think_cost - t.think_tokens * .001) < 1e-8
+              and abs(sum(x["think_cost"] for x in t.turn_log) - t.think_cost) < 1e-8)
+    expected_returns = [t.reward - t.think_cost for t in shaped.trajs for _ in t.datums]
+    check("thinking cost is charged once per trajectory, shared by compressed segments",
+          shaped.returns == expected_returns and shaped.correctness == res.correctness
+          and shaped.metrics["rollout/correct_rate"] == .5)
+    class SplitRenderer(AgentRenderer):
+        def continue_prompt(self, *args, **kwargs):
+            return None
+
+        def fit(self, env, *args, **kwargs):
+            ids, text, level = super().fit(env, *args, **kwargs)
+            return [len(env.messages())] + ids, text, level
+
+    split = await run_agent_rollout(tasks, Source(client), ScriptedSampler(tok, script),
+                                    SplitRenderer(tok), p, train=True)
+    check("broken prefixes split datums without duplicating cost or losing correctness",
+          len(split.trajs[0].datums) > 1
+          and split.returns == [t.reward - t.think_cost for t in split.trajs for _ in t.datums]
+          and split.correctness == [t.reward >= 1 for t in split.trajs for _ in t.datums])
+    p.truncated_turn = "drop_traj"
+    dropped = await run_agent_rollout(tasks, Source(client), ScriptedSampler(tok, script),
+                                      renderer, p, train=True)
+    check("correctness alignment after dropping a truncated trajectory",
+          len(dropped.correctness) == len(dropped.datums)
+          and dropped.correctness == [t.reward >= 1 for t in dropped.trajs for _ in t.datums])
     print(f"    prompts={sampler.n_prompts} max_prompt_tokens={sampler.max_prompt} "
           f"datums={len(data)} adv_zero={adv_m.get('ppo/adv_zero_frac')}")
     print("\n" + ("ALL PASS" if ok else "SOME CHECKS FAILED"))
