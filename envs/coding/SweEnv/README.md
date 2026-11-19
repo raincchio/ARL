@@ -175,6 +175,7 @@ optimizer、完整 trajectories、best solutions 保存均关闭。训练内部 
 | `--warmup-steps` / `--warmup-lr-scale` | 5 / .5 |
 | `--think-budget` | 0 |
 | `--think-cost-lambda` / `--think-cost-free-tokens` | 0 / 0 |
+| `--format-reward-weight` | 通用入口默认 0，Qwen3.6 aligned 配方为 0.05。每条训练轨迹按上报 `format_ok` 的轮次计算格式正确率，再乘以权重加到终局回报。无格式记录时加 0 分。 |
 | `--mask-positive-incorrect` / `--no-mask-positive-incorrect` | False |
 | `--mask-negative-correct` / `--no-mask-negative-correct` | False |
 | `--save-optimizer` / `--no-save-optimizer` | False |
@@ -228,8 +229,8 @@ KERNEL_RL_ZERO3_REDUCE_BUCKET=100000000 KERNEL_RL_FREEZE_ROUTER=0 KERNEL_RL_FREE
 ./script/4b_train_qwen36.sh \
   run_dir=/root/share/arl-runs/swe10_qwen36_async_v1 \
   harness=mini_swe_agent COLOCATE=1 SAMPLING_UTIL=0.7 SAMPLER_DP=4 \
-  sampling_replay=True router_replay=True batch_size=8 group_size=8 \
-  num_epochs=10 eval_num_samples=8 max_turns=250 eval_tp=4 eval_concurrency=64 \
+  sampling_replay=True router_replay=True batch_size=8 train_group_size=8 \
+  num_epochs=10 eval_group_size=8 max_turns=250 eval_tp=4 eval_concurrency=64 \
   max_tokens=40960 PACK_TOKENS=32768 HEAD_CHUNKS=8 \
   think_budget=32768 think_cost_lambda=0.001 think_cost_free_tokens=8192 \
   warmup_steps=30 warmup_lr_scale=0.5 \
@@ -275,10 +276,13 @@ GPU 租约继续使用 ARM 的 `/root/share/arm_async_eval/v1/gpu_leases` 协议
 
 SWE10 独立评估默认将全部选中的题目及其采样轨迹放入同一批队列，最多同时运行
 64 条轨迹（`eval_concurrency=64`），结束一条即可让等待的轨迹接入，不再每两题等待
-整批结束。每题默认 8 条轨迹（`eval_num_samples=8`），评估默认关闭 router replay，
+整批结束。每题默认 8 条轨迹（`eval_group_size=8`），评估默认关闭 router replay，
 只记录 `resolved_rate` 和 `pass_any_rate`。同步与异步评估均使用 TP=4；同步评估显存
 利用率可用 `eval_util` 覆盖。训练仍由 `batch_size` 和 `concurrency` 单独控制。已启动的评估不会热更新；
 修改当前 run 的 spec 后，下一次 checkpoint 子进程读取新配置。
+
+`train_concurrency=-1` 和 `eval_concurrency=-1` 分别关闭训练和评估的本地工作区并发上限。
+评估设置适用于基座、周期 checkpoint 和最终模型。正整数指定并发上限。
 
 评估输出：`async_eval/metrics.jsonl`、`done/`、`failed/`、`running/`、`progress/`、
 `results/<checkpoint>/<attempt>/` 和 `logs/`。失败重试使用新 attempt，不覆盖旧结果；

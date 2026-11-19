@@ -9,6 +9,7 @@ from typing import Any
 
 import torch
 
+from arl.models import sequence_parallel
 from arl.models import tinker_compat as tinker
 from arl.models.types import LossFnType
 from arl.models.registry import get_adam_params
@@ -69,7 +70,8 @@ def _rebalance_enabled() -> bool:
 
     return (dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
             and int(os.environ.get("KERNEL_RL_PACK_TOKENS", "0")) > 0
-            and os.environ.get("KERNEL_RL_REBALANCE", "1") != "0")
+            and os.environ.get("KERNEL_RL_REBALANCE", "1") != "0"
+            and not sequence_parallel.enabled())
 
 
 def _with_resp_weight(batch: list[tinker.Datum]) -> list[tinker.Datum]:

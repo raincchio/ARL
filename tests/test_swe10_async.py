@@ -16,10 +16,10 @@ from test_swe10 import RecipeTests
 
 
 class AsyncSweTests(unittest.TestCase):
-    def fixture(self,root):
+    def fixture(self,root,*extra_args):
         args=swe10.parser().parse_args(swe10.normalize_key_values([
             'eval_async=True','eval_every=5','batch_size=8','num_epochs=10','harness=mini_swe_agent','wandb=False',
-            'eval_num_samples=2',f'run_dir={root}']))
+            'eval_num_samples=2',f'run_dir={root}',*extra_args]))
         (root/'tasks.private.jsonl').write_text('frozen records')
         (root/'tasks.json').write_text(json.dumps({'instance_ids':[str(i) for i in range(10)]}))
         configs=swe10.configurations(args,root)
@@ -75,6 +75,32 @@ class AsyncSweTests(unittest.TestCase):
             self.assertEqual(env['KERNEL_RL_SAMPLER_DP'],'2')
             self.assertEqual(env['KERNEL_RL_COLOCATE'],'0')
             self.assertNotIn('WORLD_SIZE',env)
+
+    def test_unlimited_workspace_limit_reaches_all_eval_phases(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _, configs, spec = self.fixture(root, 'train_concurrency=3', 'eval_concurrency=-1')
+            self.assertEqual(configs['train']['train']['options']['eval_max_concurrency'], 3)
+            for name in ('base', '000005', 'final'):
+                if name != 'base':
+                    self.publish(root, name, 5)
+                config, _ = evaluation_config(root, name, spec, root/'attempt')
+                self.assertEqual(config['evaluate']['options']['eval_max_concurrency'], -1)
+
+    def test_eval_sampling_overrides_reach_checkpoint_and_inherit_unset_fields(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _, configs, spec = self.fixture(root, 'sampling_replay=True', 'temperature=0.8',
+                'top_p=0.9', 'top_k=40', 'eval_temperature=0', 'eval_top_k=-1')
+            train = configs['train']['train']['options']
+            self.assertEqual((train['temperature'], train['top_p'], train['top_k']), (.8, .9, 40))
+            self.assertTrue(train['sampling_replay'])
+            self.publish(root, '000005', 5)
+            for name in ('base', '000005'):
+                config, _ = evaluation_config(root, name, spec, root/'attempt')
+                options = config['evaluate']['options']
+                self.assertEqual((options['temperature'], options['top_p'], options['top_k']), (0., .9, -1))
+                self.assertFalse(options['sampling_replay'])
 
     def test_spec_pins_tp_across_evaluator_restarts(self):
         with tempfile.TemporaryDirectory() as d:

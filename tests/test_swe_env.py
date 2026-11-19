@@ -324,6 +324,19 @@ class RolloutTests(unittest.IsolatedAsyncioTestCase):
 
 
 class BackendTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unlimited_workspaces_can_all_start_before_any_close(self):
+        backend = ce.DockerBackend(ce.BackendConfig(max_concurrency=-1))
+        backend.rpc = AsyncMock(return_value={})
+        task = ce.SweTask.from_record(record())
+        workspaces = [backend.workspace(task) for _ in range(40)]
+        try:
+            await asyncio.wait_for(asyncio.gather(*(w.start() for w in workspaces)), timeout=5)
+            self.assertEqual(backend.rpc.await_count, len(workspaces))
+        finally:
+            await asyncio.gather(*(w.close() for w in workspaces))
+            await backend.close()
+        self.assertEqual(backend.rpc.await_count, 2 * len(workspaces))
+
     async def test_service_rpc_progresses_when_agents_fill_default_executor(self):
         from concurrent.futures import ThreadPoolExecutor
         import contextvars

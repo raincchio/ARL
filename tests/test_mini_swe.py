@@ -185,6 +185,21 @@ class MiniTests(unittest.IsolatedAsyncioTestCase):
         for d in result.datums:
             self.assertIn(-.5, d.loss_fn_inputs['logprobs'].to_torch().tolist())
 
+    async def test_format_reward_for_mixed_turns_is_shared_across_trajectory_datums(self):
+        class RetryRenderer(MiniRenderer):
+            def decode(self, ids):
+                return 'missing-tool' if ids[0] == 10 else super().decode(ids)
+
+        result = await get_harness('mini_swe_agent').run(
+            tasks=[ce.SweTask.from_record(record())], source=MiniSource(),
+            sampling_client=Sampler(), renderer=RetryRenderer(),
+            params=RolloutParams(gen_cap=10, prompt_budget=100, group_size=2, format_reward_weight=.05),
+            operation='train', env_name='coding.swe')
+        self.assertEqual(result.returns, [1.025, 1.025, .025, .025])
+        self.assertEqual(result.correctness, [True, True, False, False])
+        self.assertEqual(result.metrics['rollout/reward_mean'], .5)
+        self.assertEqual(result.metrics['rollout/format_reward_mean'], .025)
+
     async def test_invalid_truncated_and_plain_text_do_not_execute_or_submit(self):
         env = MiniEnv(ce.SweWorkspaceEnv(ce.SweTask.from_record(record()), Workspace()))
         await env.reset()

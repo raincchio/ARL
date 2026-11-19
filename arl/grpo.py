@@ -42,6 +42,7 @@ from arl.algorithms.thinking_cost import validate_thinking_cost
 from arl.env import setup_environment
 from arl.envs import get_env_spec, make_task_source_from_config
 from arl.harnesses import get_harness, resolve_pair
+from arl.models import sequence_parallel
 from arl.models import tinker_compat as tinker
 from arl.models.service import sampling_window
 from arl.models.types import LossFnType
@@ -163,6 +164,7 @@ class GRPOConfig:
     sampling_replay: bool = False
     router_replay: bool = False
     think_cost_lambda: float = 0.0            # 每 8192 个 sampled thinking token 的代价；轨迹累加
+    format_reward_weight: float = 0.0         # 轨迹内各轮 format_ok 均值的奖励权重
 
     # ── 优化 (ARM 4_train_grpo.conf 的值) ──
     learning_rate: float = 1e-6
@@ -253,7 +255,8 @@ def _validate(cfg: GRPOConfig, world_size: int) -> None:
         raise ValueError("extra_samples must be nonnegative")
     n_trajectories = cfg.batch_size * (cfg.group_size + cfg.extra_samples)
     if n_trajectories < world_size:
-        if int(os.environ.get('KERNEL_RL_PACK_TOKENS','0')) <= 0 or os.environ.get('KERNEL_RL_REBALANCE','1') == '0':
+        if not sequence_parallel.enabled() and (int(os.environ.get('KERNEL_RL_PACK_TOKENS','0')) <= 0
+                                                or os.environ.get('KERNEL_RL_REBALANCE','1') == '0'):
             raise SystemExit(f'{n_trajectories} trajectories < {world_size} ranks requires PACK_TOKENS>0 and REBALANCE=1')
     elif n_trajectories % world_size:
         logger.warning(f"{n_trajectories} 条轨迹不整除 {world_size} ranks: 各 rank 轨迹数相差 1")
@@ -475,6 +478,7 @@ async def _run_grpo(cfg: GRPOConfig, pool) -> None:
                           progress_path=os.path.join(cfg.log_path, f'rollout_progress.rank{rank}.json'),
                           truncated_turn=cfg.truncated_turn, poll_seconds=cfg.poll_seconds)
         p.think_cost_lambda = cfg.think_cost_lambda
+        p.format_reward_weight = cfg.format_reward_weight
         p.think_cost_free_tokens = cfg.think_cost_free_tokens
         res = await selected_harness.run(tasks=tasks, source=source, sampling_client=sampling_client,
             renderer=renderer, params=p, operation='train', env_name=get_env_spec(cfg.env).name,
@@ -605,7 +609,7 @@ _MEAN_KEYS = ("rollout/reward_mean", "rollout/correct_rate", "rollout/faster_eag
               "rollout/format_ok_per_turn", "rollout/eval_calls_per_traj", "rollout/append_rate",
               "rollout/datums_per_traj", "ppo/reward_mean",
               "rollout/resolved_rate",
-              "rollout/think_tokens_mean", "rollout/think_cost_mean",
+              "rollout/think_tokens_mean", "rollout/think_cost_mean", "rollout/format_reward_mean",
               "ppo/adv_zero_frac")
 _SUM_KEYS = ("rollout/n_trajs", "rollout/ctx_overflow_trajs", "rollout/sample_fail_trajs",
              "rollout/invalid_trace_trajs",

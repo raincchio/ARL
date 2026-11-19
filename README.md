@@ -11,15 +11,29 @@ Qwen3.6 SWE 当前入口为 `script/4b_train_qwen36.sh`：mini_swe_agent、250 �
 独立的 `<训练名>-eval` W&B run，记录 resolved_rate 和 pass_any_rate。
 默认值及覆盖参数见 [SWE 说明](envs/coding/SweEnv/README.md)。
 
-每题评估采样数可在启动时显式设置：
+启动时用 `train_group_size` 和 `eval_group_size` 分别设置训练、评估的每题轨迹数。
 
 ```bash
-./script/4b_train_qwen36.sh eval_samples=8
+./script/4b_train_qwen36.sh train_group_size=16 eval_group_size=8
 ```
 
-也支持 `--eval-samples 8`、`eval_num_samples=8` 和 `EVAL_SAMPLES=8`。
-默认每题 8 条，同时用于 baseline、周期 checkpoint 和最终评估，独立于训练的 `group_size`。
+两者默认均为 8。训练值指定每题目标保留的轨迹数，评估值用于基座、周期 checkpoint 和最终评估。
+旧参数 `group_size`（训练）及 `eval_samples`、`eval_num_samples`、`EVAL_SAMPLES`（评估）继续可用。
 参数随运行冻结到 `async_eval/spec.json`，修改启动参数不影响已经创建的运行。
+
+训练和评估共用的解码参数默认是 `temperature=1.0 top_p=0.95 top_k=20`。
+评估可逐项覆盖，例如 `./script/4b_train_qwen36.sh temperature=0.8 top_p=0.9 top_k=40 eval_temperature=0.6`。
+基座、周期 checkpoint 和最终评估都会使用覆盖值。`eval_top_p` 和 `eval_top_k` 同样可单独设置。
+
+Qwen3.6 SWE 训练默认用 `0.05` 乘以每条轨迹的工具调用格式正确率。启动时可用
+`./script/4b_train_qwen36.sh format_reward_weight=0.1` 调整，设为 `0` 可关闭。
+也可通过环境变量 `FORMAT_REWARD_WEIGHT` 设置，显式命令行参数优先。
+
+`train_concurrency` 控制每个训练 rank 的 SWE 工作区并发数，默认 2。16 个 rank 下，
+`./script/4b_train_qwen36.sh train_concurrency=8` 将训练端上限设为 128 个工作区。
+也可设置环境变量 `TRAIN_CONCURRENCY`。加 `--check` 可查看总上限 `train_workspace_limit`。
+`train_concurrency=-1` 和 `eval_concurrency=-1` 分别取消训练端和评估端的工作区名额限制。
+评估默认 64，也可用环境变量 `EVAL_CONCURRENCY` 设置。实际并发取决于轨迹数量和 SWE 服务容量。
 
 ```
 torchrun ×N 训练 rank (DeepSpeed ZeRO-3)          rank0 起的 vLLM (SAMPLER_GPUS, TP)
@@ -118,6 +132,7 @@ python3 tests/test_agent_rollout.py                           # 不用 GPU
 - `mask_positive_incorrect` / `mask_negative_correct`：默认 False。保留原组基线与白化统计，在白化之后分别屏蔽错误轨迹的正优势、正确轨迹的负优势。标签来自终局环境指标 `correct`，未知标签不屏蔽；同轨迹压缩出的所有 datum 共享标签。
 - `adv_estimator=grpo|tailrl`，以及 `group_adv_std`、`group_adv_std_floor`、`whiten_advantages`、`whiten_std`、`length_weighted_baseline` 都可从 conf 或命令行传入；Dr-GRPO 默认值保持不变。
 - `think_cost_lambda=0` 默认关闭。开启后按原始采样 token 计思考代价，每次回复只对超过 `think_cost_free_tokens=0` 的部分按每 8192 token 扣 lambda；各轮代价相加，从轨迹终局训练回报扣一次，再共享给该轨迹所有 datum。截断但保留的轮仍计代价，强制 token 不计；任务奖励、正确率和评估指标保持环境原口径。可独立开启 `think_budget` 两段式生成；强制插入的收尾 token 不参与 loss。两项均要求 `enable_thinking=True`，不要求 Kevin 的 multi_turn 环境。
+- Qwen3.6-35B-A3B 的 16 卡 ZeRO-3 训练可用 `bash script/4b_train_qwen36.sh --sp16` 开启序列并行。默认关闭，显式关闭用 `--no-sp16`。加 `--check` 可以只检查配置。开启后，16 个训练 rank 共同处理每个 token 包，采样和评估沿用原有并行布局。
 - `PACK_TOKENS=<预算>` 开启打包后，跨 rank 按 token 数重排负载，并携带源 rank 的 response 权重保持 loss 归一口径；`REBALANCE=0` 关闭重排。`HEAD_CHUNKS` 同样可由启动器传入。ZeRO-3 的 `overlap_comm` 对齐 ARM 默认关闭，可通过 `KERNEL_RL_ZERO3_OVERLAP_COMM=1` 显式开启。
 
 保留 ARL 的 agent 工具协议、轨迹终局里程碑奖励、截断轮 mask 和历史压缩策略。本次不移植 ARM 的 Kevin harness 混合、RM/value/PPO 支路、逐轮奖励/折扣和环境适配。训练侧已同步 sampling replay、MoE 路由回放、固定 RMSNorm 和共卡运行时；现有环境与 Claude Code/MCP 的执行语义保留。

@@ -26,7 +26,7 @@ from typing import Any
 import torch
 import torch.utils.checkpoint
 
-from arl.models import router_replay
+from arl.models import router_replay, sequence_parallel
 from arl.models import types as tinker
 from arl.algorithms.loss import SamplingReplay, gather_target_logprobs, ppo_surrogate
 from arl.models.types import Datum, ForwardBackwardOutput, TensorData
@@ -560,6 +560,14 @@ class LocalTrainingClient:
         self._nccl_sync = os.environ.get("KERNEL_RL_NCCL_SYNC", "1") == "1"
         # Must be set before any _ensure_sampling_engine() call below: engine placement
         # (own card vs. disjoint inference card) branches on it.
+        self._sp16 = sequence_parallel.enabled() and not inference_only
+        if self._sp16:
+            from transformers import AutoConfig
+
+            if enable_value_head or zero_stage != 3:
+                raise ValueError("SP16 supports the ZeRO-3 policy training path")
+            sequence_parallel.validate_model(AutoConfig.from_pretrained(model_name).to_dict(),
+                                             int(os.environ.get("WORLD_SIZE", "1")))
         self._inference_only = inference_only
         # 训练/采样共卡 (见 arl/colocate): 只在训练路径上有意义。
         colocated = colocate.enabled() and not inference_only
@@ -711,6 +719,8 @@ class LocalTrainingClient:
             model_name, torch_dtype=dtype, attn_implementation=attn_impl, **load_kwargs
         )
         model.config.use_cache = False
+        if self._sp16:
+            sequence_parallel.install(model)
         # Gradient checkpointing trades compute for memory -- essential for full-FT
         # of 7B+ models. Small overhead for tiny models.
         if gradient_checkpointing:
@@ -892,7 +902,8 @@ class LocalTrainingClient:
         rp_tok = rp_outside = rp_single = 0
         rp_kept_sum = 0.0
 
-        if not data:
+        sp16 = getattr(self, "_sp16", False)
+        if not data and not sp16:
             return _ImmediateFuture(ForwardBackwardOutput(loss_fn_outputs=[]))
 
         pad_id = self._tokenizer.pad_token_id
@@ -976,7 +987,11 @@ class LocalTrainingClient:
         head_chunks = max(0, int(os.environ.get("KERNEL_RL_HEAD_CHUNKS", "0")))
         if pack_budget > 0 and self._has_value_head:
             raise NotImplementedError("KERNEL_RL_PACK_TOKENS is not supported with a value head")
-        if pack_budget > 0:
+        packed = pack_budget > 0 or sp16
+        if sp16:
+            local_chunks = self._pack_by_tokens([p[4] for p in per], pack_budget)
+            chunks = sequence_parallel.schedule(local_chunks, per)
+        elif pack_budget > 0:
             from arl.utils.distributed import all_reduce_max
 
             chunks = self._pack_by_tokens([p[4] for p in per], pack_budget)
@@ -985,67 +1000,72 @@ class LocalTrainingClient:
         else:
             chunks = [list(range(i, min(i + micro_bsz, len(per)))) for i in range(0, len(per), micro_bsz)]
         rr_on = router_replay.enabled()
-        for ci, idxs in enumerate(chunks):
+        for ci, chunk in enumerate(chunks):
             # Manual accumulation boundary: reduce grads + allow step() only on the
             # last micro-batch; earlier chunks just accumulate into the grad buffers.
             self.engine.set_gradient_accumulation_boundary(ci == len(chunks) - 1)
 
-            if not idxs:
-                # Packing lockstep dummy: this rank ran out of chunks while others still
-                # have some. It MUST run the exact same module sequence as a real packed
-                # chunk -- same varlen kwargs, same norm hook with the same N lm_head
-                # calls, same checkpoint recompute in backward. Under ZeRO-3 every
-                # module call is a parameter all-gather (a collective); the plain
-                # full-logits forward this used to run made 1 lm_head call against the
-                # N+1 of a fused-head chunk, and the ranks deadlocked on the first
-                # training step (qwen36_grpo_0903_v1: NCCL RAS abort after 15 min).
-                # Reproduced and fixed by script/test_pack_lockstep.py.
-                # A synthetic pad sequence of length max(2, N) (so every row-chunk of
-                # tensor_split is non-empty) with zero loss.
-                seqs = [torch.full((max(2, head_chunks),), pad_id, dtype=torch.long)]
-                tgts = [seqs[0].clone()]
-                lengths = [len(seqs[0])]
-                idxs_eff: list[int] = []
+            if sp16:
+                idxs = chunk.indices if chunk.owner == torch.distributed.get_rank() else []
+                varlen_kwargs, tgt_row, slots = sequence_parallel.prepare(
+                    chunk, per, self.device, pad_id, head_chunks, rr_on)
             else:
-                seqs = [per[j][0] for j in idxs]
-                tgts = [per[j][1][:per[j][4]] for j in idxs]
-                lengths = [per[j][4] for j in idxs]
-                idxs_eff = list(idxs)
-            maxlen = max(lengths)
-            mb = len(lengths)
-            if rr_on:
-                # 路由回放: 这个 chunk 的 [N, layers, top_k] 索引, 挂到它的 backward 结束为止
-                # (梯度检查点重算要走同一组专家)。打包 = 首尾相接, 不打包 = 每条补到 maxlen。
-                # dummy chunk / 没有回放数据的 datum 用 -1 行 = 原生路由。
-                router_replay.begin(router_replay.build_index(
-                    [per[j][8] for j in idxs_eff] if idxs_eff else [None], lengths, self.device,
-                    pad_to=None if pack_budget > 0 else maxlen))
-            if pack_budget > 0:
-                # One row, sequences back to back. slots[k] = (row, offset) of datum k.
-                input_ids = torch.cat(seqs).unsqueeze(0).to(self.device)
-                position_ids = torch.cat(
-                    [torch.arange(L, dtype=torch.long) for L in lengths]).unsqueeze(0).to(self.device)
-                offsets = [0]
-                for L in lengths:
-                    offsets.append(offsets[-1] + L)
-                cu = torch.tensor(offsets, dtype=torch.int32, device=self.device)
-                seq_idx = torch.repeat_interleave(
-                    torch.arange(mb, dtype=torch.int32), torch.tensor(lengths)
-                ).unsqueeze(0).to(self.device)
+                idxs = chunk
+                if not idxs:
+                    # Packing lockstep dummy: this rank ran out of chunks while others still
+                    # have some. It MUST run the exact same module sequence as a real packed
+                    # chunk -- same varlen kwargs, same norm hook with the same N lm_head
+                    # calls, same checkpoint recompute in backward. Under ZeRO-3 every
+                    # module call is a parameter all-gather (a collective); the plain
+                    # full-logits forward this used to run made 1 lm_head call against the
+                    # N+1 of a fused-head chunk, and the ranks deadlocked on the first
+                    # training step (qwen36_grpo_0903_v1: NCCL RAS abort after 15 min).
+                    # Reproduced and fixed by script/test_pack_lockstep.py.
+                    # A synthetic pad sequence of length max(2, N) (so every row-chunk of
+                    # tensor_split is non-empty) with zero loss.
+                    seqs = [torch.full((max(2, head_chunks),), pad_id, dtype=torch.long)]
+                    tgts = [seqs[0].clone()]
+                    lengths = [len(seqs[0])]
+                else:
+                    seqs = [per[j][0] for j in idxs]
+                    tgts = [per[j][1][:per[j][4]] for j in idxs]
+                    lengths = [per[j][4] for j in idxs]
+                maxlen = max(lengths)
+                mb = len(lengths)
+                if rr_on:
+                    # 路由回放: 这个 chunk 的 [N, layers, top_k] 索引, 挂到它的 backward 结束为止
+                    # (梯度检查点重算要走同一组专家)。打包 = 首尾相接, 不打包 = 每条补到 maxlen。
+                    # dummy chunk / 没有回放数据的 datum 用 -1 行 = 原生路由。
+                    router_replay.begin(router_replay.build_index(
+                        [per[j][8] for j in idxs] if idxs else [None], lengths, self.device,
+                        pad_to=None if pack_budget > 0 else maxlen))
+            if packed:
                 values = None
-                slots = [(0, offsets[k]) for k in range(mb)]
-                varlen_kwargs = dict(
-                    input_ids=input_ids, position_ids=position_ids,
-                    cu_seq_lens_q=cu, cu_seq_lens_k=cu,
-                    max_length_q=maxlen, max_length_k=maxlen, seq_idx=seq_idx,
-                )
+                if not sp16:
+                    # One row, sequences back to back. slots[k] = (row, offset) of datum k.
+                    input_ids = torch.cat(seqs).unsqueeze(0).to(self.device)
+                    position_ids = torch.cat(
+                        [torch.arange(L, dtype=torch.long) for L in lengths]).unsqueeze(0).to(self.device)
+                    offsets = [0]
+                    for L in lengths:
+                        offsets.append(offsets[-1] + L)
+                    cu = torch.tensor(offsets, dtype=torch.int32, device=self.device)
+                    seq_idx = torch.repeat_interleave(
+                        torch.arange(mb, dtype=torch.int32), torch.tensor(lengths)
+                    ).unsqueeze(0).to(self.device)
+                    slots = [(0, offsets[k]) for k in range(mb)]
+                    varlen_kwargs = dict(
+                        input_ids=input_ids, position_ids=position_ids,
+                        cu_seq_lens_q=cu, cu_seq_lens_k=cu,
+                        max_length_q=maxlen, max_length_k=maxlen, seq_idx=seq_idx,
+                    )
+                    tgt_row = torch.cat(tgts).to(self.device)
                 # One gather over the whole row, then slice the fp32 [S] result per
                 # datum. Gathering per datum on logits[0, off:off+T] costs a THIRD
                 # [S,V] bf16 tensor in backward (SliceBackward materializes a
                 # zero-filled full-size grad per slice, 2+ slices => an extra copy
                 # alive next to the logits and their grad; measured 3x vs 2x [S,V]
                 # on a synthetic [8k,8k], and 71 vs 58GB at S=28k for 4 vs 2 datums).
-                tgt_row = torch.cat(tgts).to(self.device)
                 # KERNEL_RL_HEAD_CHUNKS = N > 0: never materialize the [S,V] logits at
                 # all. The model runs with logits_to_keep=1 (lm_head on one token), and
                 # a forward hook on the final norm -- i.e. still INSIDE the top-level
@@ -1086,6 +1106,12 @@ class LocalTrainingClient:
                 if rp_stats:
                     rp_in_row = torch.cat(rp_stats["in_set"])
                     rp_kept_row = torch.cat(rp_stats["n_kept"])
+                if sp16:
+                    total = sum(chunk.lengths)
+                    lp_row = sequence_parallel.gather_output(lp_row, total)
+                    if rp_stats:
+                        rp_in_row = sequence_parallel.gather_output(rp_in_row, total)
+                        rp_kept_row = sequence_parallel.gather_output(rp_kept_row, total)
             else:
                 input_ids = torch.full((mb, maxlen), pad_id, dtype=torch.long, device=self.device)
                 attn = torch.zeros((mb, maxlen), dtype=torch.long, device=self.device)
@@ -1106,20 +1132,20 @@ class LocalTrainingClient:
                 # dummy: zero loss through the same graph (backward gathers the same
                 # params in the same order as a real chunk), nothing to account for.
                 router_replay.backward_phase()
-                self.engine.backward(lp_row.sum() * 0.0)
+                self.engine.backward(lp_row[:0].sum())
                 del logits, lp_row
                 continue
 
             surrogate_sum = None
             value_sum = None
             kl_term_sum = None
-            for k, j in enumerate(idxs_eff):
-                T = lengths[k]
+            for k, j in enumerate(idxs):
+                T = per[j][4]
                 row, off = slots[k]
                 tgt = per[j][1][:T].to(self.device)
                 old = per[j][2][:T].to(self.device)
                 adv = per[j][3][:T].to(self.device)
-                if pack_budget > 0:
+                if packed:
                     lp = lp_row[off : off + T]
                     if replay is not None:
                         rp_in, rp_kept = rp_in_row[off : off + T], rp_kept_row[off : off + T]

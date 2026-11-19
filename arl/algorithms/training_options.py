@@ -4,6 +4,9 @@ import os
 
 
 def validate_training_options(cfg):
+    format_weight = getattr(cfg, 'format_reward_weight', 0.)
+    if not math.isfinite(format_weight) or format_weight < 0:
+        raise ValueError('format_reward_weight must be finite and >= 0')
     from arl.models.prefill import engine_args as prefill_engine_args
     prefill_engine_args(getattr(cfg,'sampling_prefill_tokens',0),getattr(cfg,'sampling_prefill_batch_tokens',0))
     from arl.models.prefix_cache import engine_args as prefix_cache_engine_args

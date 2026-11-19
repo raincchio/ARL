@@ -36,14 +36,17 @@ class BackendConfig:
     proxy: str = ""
     memory: str = "4g"
     cpus: float = 2.0
-    max_concurrency: int = 8           # active trajectories, not individual commands
+    max_concurrency: int = 8           # active workspaces per process; -1 disables the SWE limit
     admission_timeout: int = 14400     # host-wide backpressure can exceed a single trajectory
 
 
 class DockerBackend:
     def __init__(self, cfg: BackendConfig, *, worker_path=None, kind="SWE"):
-        if cfg.max_concurrency < 1 or cfg.cpus <= 0:
-            raise ValueError("SWE max_concurrency and cpus must be positive")
+        unlimited = kind == "SWE" and cfg.max_concurrency == -1
+        if cfg.max_concurrency < 1 and not unlimited:
+            raise ValueError(f"{kind} max_concurrency must be positive" + (" or -1" if kind == "SWE" else ""))
+        if cfg.cpus <= 0:
+            raise ValueError(f"{kind} cpus must be positive")
         self.cfg = cfg
         self.kind = kind
         if cfg.endpoint and (kind != "SWE" or cfg.ssh_host):
@@ -55,7 +58,7 @@ class DockerBackend:
         # SWE server code belongs to the host service project. The optional
         # injected source remains only for other environment-specific workers.
         self._worker = Path(worker_path).read_text() if worker_path is not None else None
-        self._slots = asyncio.Semaphore(cfg.max_concurrency)
+        self._slots = None if unlimited else asyncio.Semaphore(cfg.max_concurrency)
         # Agent threads synchronously wait for workspace RPCs. Sharing their
         # default executor deadlocks when every worker is occupied by an agent.
         self._service_executor = (ThreadPoolExecutor(max_workers=64, thread_name_prefix="swe-http")
@@ -178,8 +181,9 @@ class DockerWorkspace:
             raise BackendError("workspace is closed")
         if self._started:
             return
-        await self.backend._slots.acquire()
-        self._slot = True
+        if self.backend._slots is not None:
+            await self.backend._slots.acquire()
+            self._slot = True
         # Set before issuing start so cancellation/failed transport also attempts cleanup.
         self._started = True
         try:

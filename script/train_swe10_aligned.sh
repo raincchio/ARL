@@ -10,7 +10,7 @@ exec "$ROOT/script/train_swe10.sh" \
   --harness mini_swe_agent --eval-async \
   --colocate --sampling-util 0.7 --sampler-dp 4 \
   --sampling-replay --router-replay \
-  --batch-size 8 --group-size 8 --epochs 10 \
+  --batch-size 8 --train-group-size 8 --epochs 10 \
   --max-turns 250 \
   --max-tokens 40960 \
   --prefill-tokens 1056 --prefill-batch-tokens 2048 \
@@ -19,6 +19,7 @@ exec "$ROOT/script/train_swe10.sh" \
   --adv-estimator grpo --think-budget 32768 \
   --warmup-steps 30 --warmup-lr-scale 0.5 \
   --think-cost-lambda 0.001 --think-cost-free-tokens 8192 \
+  --format-reward-weight "${FORMAT_REWARD_WEIGHT:-0.05}" \
   --mask-positive-incorrect --mask-negative-correct \
   --no-save-optimizer --no-save-trajectories --no-save-best-solutions \
   "$@"

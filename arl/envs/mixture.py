@@ -20,7 +20,7 @@ MEMBER_OPTIONS = frozenset({
     'ifeval_reward_mode', 'ifeval_split_seed', 'ifeval_python', 'ifeval_upstream', 'ifeval_timeout',
     'enable_thinking', 'reasoning_effort', 'group_size', 'extra_samples', 'temperature', 'top_p', 'top_k',
     'max_tokens', 'prompt_budget_tokens', 'truncated_turn', 'poll_seconds',
-    'think_cost_lambda', 'think_cost_free_tokens', 'think_budget', 'think_force_text', 'eval_harness', 'eval_num_samples', 'eval_temperature', 'eval_top_p', 'eval_top_k',
+    'format_reward_weight', 'think_cost_lambda', 'think_cost_free_tokens', 'think_budget', 'think_force_text', 'eval_harness', 'eval_num_samples', 'eval_temperature', 'eval_top_p', 'eval_top_k',
 })
 
 

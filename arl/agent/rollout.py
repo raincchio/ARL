@@ -56,6 +56,7 @@ class RolloutParams:
     think_end_ids: list[int] | None = None
     progress_path: str = ""      # optional per-rank live status, independent of trajectory logging
     shard_trajectories: bool = False  # tasks is global; distribute individual siblings across ranks
+    format_reward_weight: float = 0.0
 
 
 def trajectory_slots(n_tasks: int, n_per: int, rank: int, world_size: int,
@@ -499,11 +500,20 @@ async def _run_agent_rollout(tasks, source, sampling_client, renderer, p, *,
     # ── 收尾: 终局奖励 -> 每个 datum ──
     datums, returns, groups, units, correctness = [], [], [], [], []
     n_infra = 0
+    format_reward_total = 0.0
     for t in trajs:
         if t.infra and not t.dropped:
             t.dropped = "infra_error"
             n_infra += 1
-        if t.dropped or not train or not t.transitions:
+        if t.dropped or not train:
+            continue
+        format_reward = 0.0
+        if p.format_reward_weight:
+            scores = [m["format_ok"] for m in t.turn_metrics if "format_ok" in m]
+            if scores:
+                format_reward = p.format_reward_weight * (sum(scores) / len(scores))
+                format_reward_total += format_reward
+        if not t.transitions:
             continue
         # 前缀递增的轮次合成一个 datum, 压缩断开处另起 (data_processing.trajectory_to_data)
         t.datums = [d for d in base_datums_for_response(Trajectory(
@@ -512,7 +522,7 @@ async def _run_agent_rollout(tasks, source, sampling_client, renderer, p, *,
         if not t.datums:
             continue
         datums.extend(t.datums)
-        returns.extend([t.reward - t.think_cost] * len(t.datums))
+        returns.extend([t.reward + format_reward - t.think_cost] * len(t.datums))
         groups.extend([(t.group,)] * len(t.datums))
         units.extend([(t.tid, 0)] * len(t.datums))
         # Use trajectory outcome labels; reward shaping must not change correctness.
@@ -521,6 +531,8 @@ async def _run_agent_rollout(tasks, source, sampling_client, renderer, p, *,
 
     metrics = _rollout_metrics(trajs, n_ctx_overflow, n_sample_fail, n_env_error,
                                n_extra_dropped, n_infra, t_wall, world_size)
+    if train and p.format_reward_weight:
+        metrics["rollout/format_reward_mean"] = format_reward_total / max(1, metrics["rollout/n_trajs"])
     if p.think_budget:
         kept_responses = [t for t in trajs if t.dropped != "extra_sample"]
         metrics["rollout/think_forced_rate"] = sum(t.n_think_forced for t in kept_responses) / max(1, sum(len(t.resp_lens) for t in kept_responses))

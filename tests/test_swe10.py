@@ -109,13 +109,13 @@ class RecipeTests(unittest.TestCase):
                 '--batch-size','8','--group-size','8','--epochs','10','--eval-samples','16',
                 '--max-turns','4','--max-tokens','40960',
                 '--think-budget','32768','--warmup-steps','30','--warmup-lr-scale','.5',
-                '--think-cost-lambda','.005','--think-cost-free-tokens','8192',
+                '--think-cost-lambda','.005','--think-cost-free-tokens','8192','--format-reward-weight','.05',
                 '--mask-positive-incorrect','--mask-negative-correct',
                 '--no-save-trajectories','--no-save-optimizer','--no-save-best-solutions'])
             configs=swe10.configurations(args,Path('/tmp/aligned'))
             train=configs['train']['train']['options']
             expected={'sampling_replay':True,'router_replay':True,'warmup_steps':30,
-                'think_budget':32768,'think_cost_lambda':.005,'think_cost_free_tokens':8192,
+                'think_budget':32768,'think_cost_lambda':.005,'think_cost_free_tokens':8192,'format_reward_weight':.05,
                 'mask_positive_incorrect':True,'mask_negative_correct':True,
                 'save_optimizer':False,'save_trajectories':False,'save_best_solutions':False}
             for key,value in expected.items():self.assertEqual(train[key],value,key)
@@ -123,6 +123,7 @@ class RecipeTests(unittest.TestCase):
                 options=configs[phase]['evaluate']['options']
                 self.assertFalse(options['router_replay'])
                 self.assertEqual(options['think_cost_lambda'],0)
+                self.assertNotIn('format_reward_weight', options)
                 self.assertEqual(options['think_budget'],32768)
                 self.assertFalse(options['save_trajectories'])
             env=swe10.runtime_env(args,True)

@@ -27,7 +27,7 @@ NATIVE_INFERENCE_OPTIONS = {
     'enable_thinking', 'reasoning_effort', 'batch_size', 'group_size', 'extra_samples',
     'temperature', 'top_p', 'top_k', 'max_tokens', 'prompt_budget_tokens',
     'sampling_prefill_tokens', 'sampling_prefill_batch_tokens', 'enable_prefix_caching', 'mamba_cache_mode',
-    'sampling_max_model_len', 'truncated_turn', 'poll_seconds', 'think_cost_lambda',
+    'sampling_max_model_len', 'truncated_turn', 'poll_seconds', 'think_cost_lambda', 'format_reward_weight',
     'think_cost_free_tokens', 'sampling_replay', 'router_replay', 'think_budget', 'think_force_text',
     'save_trajectories', 'save_best_solutions',
 }
@@ -161,6 +161,7 @@ async def run_native(plan, *, source=None, sampling_client=None, tokenizer=None,
                 progress_path=str(output/'rollout_progress.rank0.json'),
                 truncated_turn=cfg.truncated_turn, poll_seconds=cfg.poll_seconds,
                 think_cost_lambda=cfg.think_cost_lambda if plan.phase == 'collect' else 0.,
+                format_reward_weight=cfg.format_reward_weight if plan.phase == 'collect' else 0.,
                 think_cost_free_tokens=cfg.think_cost_free_tokens)
             result = await selected.run(tasks=tasks[start:start+cfg.batch_size], source=source,
                 sampling_client=sampling_client, renderer=renderer, params=params, operation=plan.phase, env_name=plan.env,

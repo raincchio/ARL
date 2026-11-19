@@ -17,7 +17,10 @@ IFS=',' read -ra SG <<<"$SAMPLER_GPUS"
 NPROC=${#TG[@]}
 source "$ROOT/script/training_runtime.sh"
 arl_training_gpu_layout "$TRAIN_GPUS" "$SAMPLER_GPUS" "${COLOCATE:-0}" || exit 1
-(( batch_size >= NPROC )) || { echo "batch_size < training ranks"; exit 1; }
+SP16="${SP16:-${KERNEL_RL_SP16:-0}}"
+[[ "$SP16" == 0 || "$SP16" == 1 ]] || { echo "SP16 must be 0 or 1"; exit 1; }
+(( SP16 == 0 || NPROC == 16 )) || { echo "SP16 requires exactly 16 training ranks"; exit 1; }
+(( SP16 || batch_size >= NPROC )) || { echo "batch_size < training ranks"; exit 1; }
 (( SAMPLER_DP > 0 && ${#SG[@]} % SAMPLER_DP == 0 )) || { echo "Invalid SAMPLER_DP"; exit 1; }
 log_path="$(date +"$log_path")"
 if [[ "$log_path" != /* ]]; then log_path="$ROOT/$log_path"; fi
@@ -33,6 +36,7 @@ for k in harness eval_harness train_set test_set test_fraction test_limit task_l
     temperature top_p top_k max_tokens prompt_budget_tokens sampling_max_model_len \
     truncated_turn learning_rate warmup_steps warmup_lr_scale grad_clip num_substeps clip_low clip_high \
     adv_estimator group_adv_std group_adv_std_floor whiten_advantages whiten_std length_weighted_baseline \
+    format_reward_weight \
     mask_positive_incorrect mask_negative_correct think_cost_lambda think_cost_free_tokens think_budget think_force_text sampling_replay router_replay save_optimizer \
     eval_every eval_at_start eval_num_samples save_every load_checkpoint_path resume_optimizer start_batch \
     reasoning_effort enable_thinking wandb_project; do
@@ -45,7 +49,7 @@ ENV=("PYTHONPATH=$ROOT" "HF_HUB_OFFLINE=1" "TRANSFORMERS_OFFLINE=1"
   "KERNEL_RL_SAMPLER_DP=$SAMPLER_DP" "KERNEL_RL_SAMPLING_GPU_UTIL=$SAMPLING_UTIL"
   "KERNEL_RL_ZERO_OFFLOAD=$ZERO_OFFLOAD" "KERNEL_RL_MICRO_BSZ=1"
   "KERNEL_RL_PACK_TOKENS=${PACK_TOKENS:-0}" "KERNEL_RL_HEAD_CHUNKS=${HEAD_CHUNKS:-0}"
-  "KERNEL_RL_REBALANCE=${REBALANCE:-1}"
+  "KERNEL_RL_REBALANCE=${REBALANCE:-1}" "KERNEL_RL_SP16=$SP16"
   "KERNEL_RL_COLOCATE=${COLOCATE:-0}" "KERNEL_RL_COLOCATE_HEADROOM_GB=${COLOCATE_HEADROOM_GB:-8}")
 for k in NCCL_DEBUG PYTORCH_CUDA_ALLOC_CONF DEEPSPEED_TIMEOUT KERNEL_RL_FIXED_RMSNORM KERNEL_RL_WANDB_PROXY; do
   [[ -z "${!k:-}" ]] || ENV+=("$k=${!k}")
